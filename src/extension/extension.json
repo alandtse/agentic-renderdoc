@@ -1,0 +1,9 @@
+{
+    "extension_api": 1,
+    "name": "agentic-renderdoc",
+    "version": "0.1.0",
+    "minimum_renderdoc": "1.0",
+    "description": "Bridge extension for AI-assisted graphics debugging.",
+    "author": "Eden Labs",
+    "url": ""
+}
