@@ -157,20 +157,23 @@ class RenderDocClient:
 
     # --- Request / response ---
 
-    def send(self, cmd: str, params: dict) -> dict:
+    def send(self, cmd: str, params: dict,
+             read_timeout: float | None = None) -> dict:
         """Send a command and return the parsed response.
 
         Auto-connects if no connection is active. If the send or receive
         fails due to a connection error, reconnects once to the same port
         and retries the request. Raises on the second failure.
 
-        cmd    -- Command name (e.g. "eval", "instance_info").
-        params -- Command parameters dict.
+        cmd          -- Command name (e.g. "eval", "instance_info").
+        params       -- Command parameters dict.
+        read_timeout -- Override the socket read timeout for this call.
+                        Defaults to the module-level _READ_TIMEOUT (30s).
         """
         self.ensure_connected()
         assert self._sock is not None
 
-        return self._send_with_retry(cmd, params)
+        return self._send_with_retry(cmd, params, read_timeout=read_timeout)
 
     def _read_response(self) -> dict:
         """Read a newline-delimited JSON response.
@@ -191,36 +194,41 @@ class RenderDocClient:
 
     # --- Internal helpers ---
 
-    def _send_with_retry(self, cmd: str, params: dict) -> dict:
+    def _send_with_retry(self, cmd: str, params: dict,
+                         read_timeout: float | None = None) -> dict:
         """Execute a single send/recv, retrying once on connection failure.
 
         On the first connection error, disconnects, reconnects to the
         same port, and replays the request. If the retry also fails, the
         error propagates to the caller.
 
-        cmd    -- Command name.
-        params -- Command parameters dict.
+        cmd          -- Command name.
+        params       -- Command parameters dict.
+        read_timeout -- Passed through to _do_send.
         """
         assert self._sock is not None
         assert self._port is not None
 
         try:
-            return self._do_send(cmd, params)
+            return self._do_send(cmd, params, read_timeout=read_timeout)
         except (ConnectionError, BrokenPipeError, OSError):
             # Reconnect once and retry.
             port = self._port
             self.disconnect()
             self.connect(port)
-            return self._do_send(cmd, params)
+            return self._do_send(cmd, params, read_timeout=read_timeout)
 
-    def _do_send(self, cmd: str, params: dict) -> dict:
+    def _do_send(self, cmd: str, params: dict,
+                 read_timeout: float | None = None) -> dict:
         """Perform the raw send and receive on the current socket.
 
         Serializes the command as a JSON line, sends it, and reads the
         response. Does not handle reconnection.
 
-        cmd    -- Command name.
-        params -- Command parameters dict.
+        cmd          -- Command name.
+        params       -- Command parameters dict.
+        read_timeout -- Socket read timeout in seconds. Defaults to the
+                        module-level _READ_TIMEOUT (30s).
         """
         assert self._sock is not None
 
@@ -229,7 +237,8 @@ class RenderDocClient:
         self._sock.settimeout(_WRITE_TIMEOUT)
         self._sock.sendall(request.encode("utf-8"))
 
-        self._sock.settimeout(_READ_TIMEOUT)
+        self._sock.settimeout(read_timeout if read_timeout is not None
+                              else _READ_TIMEOUT)
         return self._read_response()
 
     def _probe_port(self, port: int, enrich: bool = False) -> dict | None:
@@ -425,15 +434,16 @@ class ConnectionPool:
         self._default = alias
 
     def send(self, cmd: str, params: dict,
-             alias: str | None = None) -> dict:
+             alias: str | None = None,
+             read_timeout: float | None = None) -> dict:
         """Send a command to a named (or default) connection.
 
-        alias -- Target connection. If None, uses the explicit default or
-                 the sole active connection. Raises if the target is
-                 ambiguous (multiple connections, no default set).
+        alias        -- Target connection. If None, uses the explicit default
+                        or the sole active connection. Raises if ambiguous.
+        read_timeout -- Override socket read timeout for this call.
         """
         client = self._resolve(alias)
-        return client.send(cmd, params)
+        return client.send(cmd, params, read_timeout=read_timeout)
 
     # --- Discovery ---
 

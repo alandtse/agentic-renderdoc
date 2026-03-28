@@ -1,4 +1,4 @@
-"""MCP tool definitions for eval, search_api, instance, and get_texture."""
+"""MCP tool definitions for eval, search_api, instance, get_texture, and task management."""
 
 from __future__ import annotations
 
@@ -6,6 +6,9 @@ import base64
 import io
 import json
 import struct
+import threading
+import time
+import uuid
 
 from PIL import Image as PILImage
 
@@ -17,11 +20,58 @@ from server.client import ConnectionPool
 
 _pool = ConnectionPool()
 
+# ---------------------------------------------------------------------------
+# Async task registry
+# ---------------------------------------------------------------------------
+
+_tasks: dict[str, dict] = {}
+_tasks_lock = threading.Lock()
+
+
+def _make_task_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+
+def _run_async(task_id: str, cmd: str, params: dict, alias: str | None,
+               timeout: float) -> None:
+    """Worker target: run a pool command and store the result in _tasks."""
+    try:
+        result = _pool.send(cmd, params, alias=alias, read_timeout=timeout)
+        with _tasks_lock:
+            _tasks[task_id]["status"] = "done"
+            _tasks[task_id]["result"] = result
+    except Exception as e:
+        with _tasks_lock:
+            _tasks[task_id]["status"] = "error"
+            _tasks[task_id]["error"]  = str(e)
+
+
+def _start_task(cmd: str, params: dict, alias: str | None,
+                timeout: float = 300.0) -> str:
+    """Register a task, fire it on a daemon thread, return the task_id."""
+    task_id = _make_task_id()
+
+    with _tasks_lock:
+        _tasks[task_id] = {
+            "status"    : "pending",
+            "started_at": time.monotonic(),
+            "alias"     : alias,
+        }
+
+    t = threading.Thread(
+        target=_run_async,
+        args=(task_id, cmd, params, alias, timeout),
+        daemon=True,
+    )
+    t.start()
+    return task_id
+
 
 # --- eval ---
 
 @mcp.tool(name="Eval")
-def eval(code: str, instance: str | None = None) -> dict:
+def eval(code: str, instance: str | None = None,
+         async_mode: bool = False, timeout: float = 300.0) -> dict:
     """Execute Python code in a live RenderDoc replay session.
 
     This is your primary interface for all GPU capture inspection, analysis,
@@ -454,7 +504,36 @@ def eval(code: str, instance: str | None = None) -> dict:
 
     Omit instance= when only one connection is active (backward-
     compatible). Use Instance(action='list') to see available aliases.
+
+    ASYNC MODE
+    ==========
+    For long-running operations (large buffer scans, full-frame pixel
+    diffs, etc.) that may exceed the normal 30-second timeout, set
+    async_mode=True. The call returns immediately with a task_id; use
+    Task(action="poll", task_id=...) to retrieve the result.
+
+        t = Eval(code="...", async_mode=True, timeout=120)
+        # ... do other work ...
+        Task(action="poll", task_id=t["task_id"])
+
+    timeout controls the socket read deadline for the background call
+    (default 300s). Ignored when async_mode=False.
+
+    To fire work at two instances in parallel and collect both results:
+
+        t1 = Eval(code="describe_draw(100)", instance="baseline", async_mode=True)
+        t2 = Eval(code="describe_draw(100)", instance="broken",   async_mode=True)
+        Task(action="poll", task_id=t1["task_id"])
+        Task(action="poll", task_id=t2["task_id"])
     """
+    if async_mode:
+        try:
+            task_id = _start_task("eval", {"code": code},
+                                  alias=instance, timeout=timeout)
+            return {"task_id": task_id, "status": "pending"}
+        except (ConnectionError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
+
     try:
         return _pool.send("eval", {"code": code}, alias=instance)
     except (TimeoutError, OSError) as e:
@@ -842,6 +921,102 @@ def instance(
             return {"ok": True, "default": alias}
         except KeyError as e:
             return {"ok": False, "error": str(e)}
+
+    else:
+        return {"ok": False, "error": f"unknown action: {action!r}"}
+
+
+# --- task ---
+
+@mcp.tool(name="Task")
+def task(action: str, task_id: str | None = None) -> dict:
+    """Manage async tasks started by Eval(async_mode=True).
+
+    action: One of "poll", "cancel", "list".
+
+    POLL
+    ----
+    Task(action="poll", task_id="abc123")
+        Check whether an async task has completed.
+
+        Returns one of:
+
+            {"task_id": "...", "status": "pending", "elapsed_s": 1.2}
+                Still running. Poll again later.
+
+            {"task_id": "...", "status": "done", "elapsed_s": 4.7,
+             "result": {...}}
+                Completed. "result" is identical to what a synchronous
+                Eval call would have returned.
+
+            {"task_id": "...", "status": "error", "elapsed_s": 2.1,
+             "error": "..."}
+                Failed (connection dropped, exception in eval, etc.).
+
+            {"ok": False, "error": "unknown task_id"}
+                Never issued or already collected.
+
+        Completed and errored tasks are removed on first poll
+        (collect-once semantics).
+
+    CANCEL
+    ------
+    Task(action="cancel", task_id="abc123")
+        Remove a pending or completed task from the registry without
+        collecting its result. No-op if already collected.
+
+    LIST
+    ----
+    Task(action="list")
+        Return all tasks currently in the registry (pending and any
+        that completed but have not yet been collected). Useful for
+        checking what is still running after firing multiple async evals.
+    """
+    if action == "poll":
+        if task_id is None:
+            return {"ok": False, "error": "task_id= required for poll"}
+        with _tasks_lock:
+            entry = _tasks.get(task_id)
+            if entry is None:
+                return {"ok": False, "error": "unknown task_id"}
+
+            status  = entry["status"]
+            elapsed = round(time.monotonic() - entry["started_at"], 2)
+
+            if status == "pending":
+                return {"task_id": task_id, "status": "pending",
+                        "elapsed_s": elapsed}
+
+            del _tasks[task_id]
+
+            if status == "done":
+                return {"task_id": task_id, "status": "done",
+                        "elapsed_s": elapsed, "result": entry["result"]}
+
+            return {"task_id": task_id, "status": "error",
+                    "elapsed_s": elapsed, "error": entry.get("error", "")}
+
+    elif action == "cancel":
+        if task_id is None:
+            return {"ok": False, "error": "task_id= required for cancel"}
+        with _tasks_lock:
+            _tasks.pop(task_id, None)
+        return {"ok": True, "cancelled": task_id}
+
+    elif action == "list":
+        with _tasks_lock:
+            now = time.monotonic()
+            return {
+                "tasks": [
+                    {
+                        "task_id"   : tid,
+                        "status"    : e["status"],
+                        "elapsed_s" : round(now - e["started_at"], 2),
+                        "instance"  : e.get("alias"),
+                    }
+                    for tid, e in _tasks.items()
+                ]
+            }
 
     else:
         return {"ok": False, "error": f"unknown action: {action!r}"}
