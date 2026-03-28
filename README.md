@@ -37,9 +37,11 @@ Two processes connected by TCP over loopback. The MCP server is spawned by the c
 
 | Tool | Purpose |
 |---|---|
-| **Eval** | Execute Python in the RenderDoc replay session. Primary interface for all inspection, analysis, and debugging. |
-| **Search API** | Search the RenderDoc Python API reference. Built by introspecting the live `renderdoc` module, so it always matches the running version. |
-| **Instance** | List, connect to, or disconnect from running RenderDoc instances. Auto-connects on first use. |
+| **Eval** | Execute Python in the RenderDoc replay session. Primary interface for all inspection, analysis, and debugging. Supports `async_mode=True` for long-running operations. |
+| **Get-Texture** | Capture a texture or render target as a viewable image. Handles HDR, float, and BGRA formats with optional crop, resize, and channel extraction. |
+| **Search-API** | Search the RenderDoc Python API reference. Built by introspecting the live `renderdoc` module, so it always matches the running version. |
+| **Instance** | List, connect to, or disconnect from running RenderDoc instances. Supports multiple simultaneous connections for cross-capture comparison. |
+| **Task** | Poll, cancel, or list async tasks started by `Eval(async_mode=True)`. |
 
 ## Pre-loaded Utilities
 

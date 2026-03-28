@@ -15,9 +15,9 @@ directly impact agent capability.
 
 ## Design Principles
 
-1. **Minimal tool surface.** Three tools. One primary (execute Python), one reference
-   (search API docs), one management (instance connection). Everything else is a utility
-   function, not a tool.
+1. **Minimal tool surface.** Four tools. One primary (execute Python), one reference
+   (search API docs), one management (instance connections), one lifecycle (async task
+   management). Everything else is a utility function, not a tool.
 2. **Rich descriptions over many tools.** The tool description encodes the RenderDoc
    access model, object graph, cursor semantics, and key patterns. The agent should
    write correct Python on the first call.
@@ -90,14 +90,21 @@ The description must cover:
   `MeshDataStage.VSIn` / `VSOut`.
 
 - **Available utilities**: `inspect(obj)`, `diff_state(eid_a, eid_b)`,
-  `goto_event(eid)`, `view_texture(id)`, and data interpretation helpers for decoding
-  raw buffer/texture bytes.
+  `save_texture(resource_id, path)`, `goto_event(eid)`, `view_texture(id)`, and data
+  interpretation helpers for decoding raw buffer/texture bytes.
 
 - **Return convention**: The last expression in the code block is returned as the
   result. Return dicts or lists for structured data.
 
 **Parameters**:
 - `code` (string, required): Python code to execute.
+- `instance` (string, optional): Alias of the target RenderDoc instance when multiple
+  are connected. Omit when only one connection is active.
+- `async_mode` (bool, optional): If true, dispatch the eval on a background thread and
+  return `{task_id}` immediately. Use `Task(action="poll")` to retrieve the result.
+  Useful for operations that exceed the 30-second synchronous timeout.
+- `timeout` (float, optional): Socket read deadline in seconds for async evals (default
+  300). Ignored when `async_mode=False`.
 
 **Returns**: JSON. The result of the last expression, or error details on failure.
 
@@ -129,19 +136,38 @@ documentation.
 
 ### 3. `instance` (management)
 
-Manage RenderDoc instance connections. On first use, auto-connects to the first available
-instance and reports any others found.
+Manage connections to one or more running RenderDoc instances. A `ConnectionPool`
+maintains named connections simultaneously, enabling cross-capture comparison workflows
+(e.g. clean build vs. artifact build open side-by-side).
 
-**Description**: Manage connections to running RenderDoc instances. Lists available
-instances, connects to a specific one, or disconnects. On first use, automatically
-connects to the first available instance.
+**Description**: Manage connections to running RenderDoc instances.
 
 **Parameters**:
-- `action` (string, required): One of `list`, `connect`, `disconnect`.
-- `port` (integer, optional): Port to connect to. Required for `connect`.
+- `action` (string, required): One of `list`, `connect`, `disconnect`, `set_default`.
+- `port` (integer, optional): TCP port to connect to directly.
+- `capture` (string, optional): Substring matched against the capture path of running
+  instances — alternative to `port` for human-friendly targeting.
+- `alias` (string, optional): Name for the connection. Auto-derived from the capture
+  filename stem if omitted.
 
-**Returns**: JSON. Instance info (port, capture state, API type) for `connect` / `list`.
-Confirmation for `disconnect`.
+**Returns**: JSON. Instance info with `alias` key for `connect`. List of all instances
+with connection status for `list`. Confirmation for `disconnect` / `set_default`.
+
+### 4. `task` (async lifecycle)
+
+Manage async tasks created by `Eval(async_mode=True)`. Kept separate from `Eval` so
+that task management (poll/cancel/list) scales to any future tool that gains async
+support without polluting individual tool signatures.
+
+**Parameters**:
+- `action` (string, required): One of `poll`, `cancel`, `list`.
+- `task_id` (string, optional): Required for `poll` and `cancel`.
+
+**Returns**:
+- `poll` — `{status: pending|done|error, elapsed_s, result?}`. Collect-once: the task
+  is removed from the registry on the first terminal-state poll.
+- `cancel` — `{ok: true, cancelled: task_id}`.
+- `list` — `{tasks: [{task_id, status, elapsed_s, instance}]}`. Non-destructive.
 
 ## Pre-loaded Utilities
 
@@ -170,6 +196,13 @@ typed, inspectable data. A human would decode these manually; these helpers enco
 - Interpret buffer bytes given a format or vertex layout.
 - Interpret texture bytes given dimensions and pixel format.
 - Summarize numeric data (min, max, NaN/Inf detection, histogram).
+
+### `save_texture(resource_id, path, mip, slice_index, event_id)`
+
+Save a texture or render target to a PNG file using RenderDoc's built-in encoder. The
+returned path can be read directly by the host's file tool (e.g. Claude Code's `Read`
+tool) for visual inspection — no Pillow dependency. Useful for saving stereo render
+targets to separate paths and comparing visually.
 
 ### UI Helpers
 
