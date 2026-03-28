@@ -13,15 +13,15 @@ from mcp.server.fastmcp.utilities.types import Image as MCPImage
 from mcp.types import TextContent
 
 from server.app import mcp
-from server.client import RenderDocClient
+from server.client import ConnectionPool
 
-_client = RenderDocClient()
+_pool = ConnectionPool()
 
 
 # --- eval ---
 
 @mcp.tool(name="Eval")
-def eval(code: str) -> dict:
+def eval(code: str, instance: str | None = None) -> dict:
     """Execute Python code in a live RenderDoc replay session.
 
     This is your primary interface for all GPU capture inspection, analysis,
@@ -443,26 +443,39 @@ def eval(code: str) -> dict:
       each event rather than looping inside one callback.
     - get_draw_calls(), get_all_actions(), and describe_draw() are
       designed to be safe single-replay-per-call utilities.
+
+    MULTIPLE INSTANCES
+    ==================
+    When more than one RenderDoc instance is connected, use the
+    instance parameter to target a specific one:
+
+        Eval(code="get_draw_calls()", instance="baseline")
+        Eval(code="get_draw_calls()", instance="broken")
+
+    Omit instance= when only one connection is active (backward-
+    compatible). Use Instance(action='list') to see available aliases.
     """
     try:
-        return _client.send("eval", {"code": code})
+        return _pool.send("eval", {"code": code}, alias=instance)
     except (TimeoutError, OSError) as e:
         return {
             "ok"    : False,
             "error" : {
                 "message" : f"Connection to RenderDoc timed out: {e}",
                 "hints"   : [
-                    "use instance(action='list') to check RenderDoc connectivity",
+                    "use Instance(action='list') to check connectivity",
                     "RenderDoc may have closed or the capture may have changed",
                 ],
             },
         }
+    except (ConnectionError, KeyError) as e:
+        return {"ok": False, "error": {"message": str(e)}}
 
 
 # --- search_api ---
 
 @mcp.tool(name="Search-API")
-def search_api(query: str) -> dict:
+def search_api(query: str, instance: str | None = None) -> dict:
     """Search the RenderDoc Python API reference by name or concept.
 
     Use this tool for discovery: finding what API exists for a task,
@@ -473,6 +486,10 @@ def search_api(query: str) -> dict:
     query: A class name, method name, enum name, or concept keyword.
            Examples: "SetFrameEvent", "ShaderStage", "GetBufferData",
                      "constant buffer", "blend".
+    instance: Optional alias of the RenderDoc instance to query. The
+              API surface is identical across instances running the same
+              build, so this is only needed when instances differ in
+              RenderDoc version.
 
     Returns a JSON array of matching entries ranked by relevance. Each entry:
         name:      Fully qualified name (e.g., "ReplayController.SetFrameEvent")
@@ -480,7 +497,10 @@ def search_api(query: str) -> dict:
         doc:       Full RST-formatted docstring with param/type/return info
         signature: Method signature string, if applicable (e.g., "(eventId, force)")
     """
-    return _client.send("api_index", {"query": query})
+    try:
+        return _pool.send("api_index", {"query": query}, alias=instance)
+    except (ConnectionError, KeyError) as e:
+        return {"ok": False, "error": {"message": str(e)}}
 
 
 # --- get_texture ---
@@ -488,6 +508,7 @@ def search_api(query: str) -> dict:
 @mcp.tool(name="Get-Texture")
 def get_texture(
     resource_id  : str,
+    instance     : str | None = None,
     event_id     : int | None = None,
     mip          : int   = 0,
     slice        : int   = 0,
@@ -543,13 +564,13 @@ def get_texture(
                  1.0). For HDR textures, values above this are clamped.
     """
     try:
-        resp = _client.send("get_texture", {
+        resp = _pool.send("get_texture", {
             "resource_id" : resource_id,
             "event_id"    : event_id,
             "mip"         : mip,
             "slice"       : slice,
             "sample"      : sample,
-        })
+        }, alias=instance)
     except (TimeoutError, OSError) as e:
         return [TextContent(
             type = "text",
@@ -726,70 +747,101 @@ def _decode_texture(raw: bytes, width: int, height: int, fmt: dict, black_point:
 # --- instance ---
 
 @mcp.tool(name="Instance")
-def instance(action: str, port: int | None = None) -> dict:
+def instance(
+    action: str,
+    port: int | None = None,
+    capture: str | None = None,
+    alias: str | None = None,
+) -> dict:
     """Manage connections to running RenderDoc instances.
 
-    Lists available instances, connects to a specific one, or disconnects.
-    On first use, automatically connects to the first available instance.
+    action: One of "list", "connect", "disconnect", "set_default".
 
-    action: One of "list", "connect", "disconnect".
-    port: Port to connect to. Required for "connect".
+    LIST
+    ----
+    Instance(action="list")
+        Probe all ports and return every running RenderDoc instance with
+        its port, capture path, and alias (if already connected).
+
+    CONNECT
+    -------
+    Instance(action="connect", port=19876)
+        Connect to a specific port. An alias is auto-derived from the
+        capture filename stem (e.g. "clean_build" from clean_build.rdc),
+        or "port_19876" if no capture is loaded.
+
+    Instance(action="connect", port=19876, alias="baseline")
+        Connect and assign an explicit alias.
+
+    Instance(action="connect", capture="clean_build", alias="baseline")
+        Find the instance whose capture path contains "clean_build"
+        (case-insensitive substring match) and connect to it. Raises if
+        zero or more than one instance matches.
+
+    DISCONNECT
+    ----------
+    Instance(action="disconnect", alias="baseline")
+        Close the named connection. Other connections are unaffected.
+        Omit alias to disconnect the sole active connection.
+
+    SET_DEFAULT
+    -----------
+    Instance(action="set_default", alias="baseline")
+        Set which instance Eval targets when instance= is omitted.
+        Unnecessary when only one connection is active.
+
+    TYPICAL COMPARISON WORKFLOW
+    ---------------------------
+        Instance(action="list")
+        Instance(action="connect", capture="clean",     alias="baseline")
+        Instance(action="connect", capture="artifacts", alias="broken")
+        Eval(code="describe_draw(eid)", instance="baseline")
+        Eval(code="describe_draw(eid)", instance="broken")
     """
     if action == "list":
-        return _enrich_instances(_client.discover_instances())
+        instances = _pool.discover_instances(enrich=True)
+        connected = _pool.connection_info()
+        return {"instances": instances, "connected": connected}
+
     elif action == "connect":
-        if port is None:
-            return {"error": "port is required for connect"}
-        _client.connect(port)
-        info   = _client.send("instance_info", {})
-        others = [
-            inst for inst in _client.discover_instances()
-            if inst["port"] != port
-        ]
-        if others:
-            info["other_instances"] = _enrich_instances(others)["instances"]
-        return info
-    elif action == "disconnect":
-        _client.disconnect()
-        return {"status": "disconnected"}
-    else:
-        return {"error": f"unknown action: {action}"}
-
-
-def _enrich_instances(instances: list[dict]) -> dict:
-    """Probe each discovered instance for metadata.
-
-    Attempts a temporary connection to each instance to fetch instance_info
-    (capture state, API type, etc.). Falls back to port-only info if the
-    probe fails.
-    """
-    enriched = []
-    for inst in instances:
-        port = inst["port"]
-        # If we are already connected to this port, query directly.
-        if _client._port == port and _client._sock is not None:
-            try:
-                info = _client.send("instance_info", {})
-                if info.get("ok") and "data" in info:
-                    enriched.append(info["data"])
-                else:
-                    enriched.append({"port": port})
-            except Exception:
-                enriched.append({"port": port})
-            continue
-
-        # Otherwise, open a temporary connection to probe.
-        probe = RenderDocClient()
+        if port is None and capture is None:
+            return {"ok": False, "error": "provide port= or capture="}
         try:
-            probe.connect(port)
-            info = probe.send("instance_info", {})
-            if info.get("ok") and "data" in info:
-                enriched.append(info["data"])
-            else:
-                enriched.append({"port": port})
-        except Exception:
-            enriched.append({"port": port})
-        finally:
-            probe.disconnect()
+            info = _pool.connect(alias=alias, port=port, capture=capture)
+            return {"ok": True, **info,
+                    "connected": _pool.connection_info()}
+        except (ValueError, ConnectionError, OSError) as e:
+            return {"ok": False, "error": str(e)}
 
-    return {"instances": enriched}
+    elif action == "disconnect":
+        target = alias or (
+            _pool.aliases[0] if len(_pool.aliases) == 1 else None
+        )
+        if target is None:
+            if not _pool.aliases:
+                return {"ok": False, "error": "no active connections"}
+            return {
+                "ok": False,
+                "error": (
+                    "multiple connections active; "
+                    "specify alias= to choose one"
+                ),
+            }
+        try:
+            _pool.disconnect(target)
+            return {"ok": True, "disconnected": target,
+                    "connected": _pool.connection_info()}
+        except KeyError as e:
+            return {"ok": False, "error": str(e)}
+
+    elif action == "set_default":
+        if alias is None:
+            return {"ok": False, "error": "alias= required for set_default"}
+        try:
+            _pool.set_default(alias)
+            return {"ok": True, "default": alias}
+        except KeyError as e:
+            return {"ok": False, "error": str(e)}
+
+    else:
+        return {"ok": False, "error": f"unknown action: {action!r}"}
