@@ -1,6 +1,7 @@
 """TCP client for communicating with the RenderDoc extension."""
 
 import json
+import os
 import socket
 
 
@@ -303,3 +304,243 @@ class RenderDocClient:
             pass
 
         return instance
+
+
+# ---------------------------------------------------------------------------
+# ConnectionPool — manages multiple named RenderDoc connections
+# ---------------------------------------------------------------------------
+
+def _alias_from_info(info: dict, port: int) -> str:
+    """Derive a default alias from instance metadata.
+
+    Uses the capture filename stem if a capture is loaded, otherwise
+    falls back to "port_<N>".
+
+    info -- instance_info data dict (may be empty).
+    port -- TCP port of the instance (used as fallback).
+    """
+    path = info.get("capture_path") if info else None
+    if path:
+        return os.path.splitext(os.path.basename(path))[0]
+    return f"port_{port}"
+
+
+class ConnectionPool:
+    """Manages named connections to multiple RenderDoc instances.
+
+    Each connection is identified by a user-chosen alias. Commands are
+    routed to the appropriate instance by alias. When only one connection
+    is active it is used automatically, preserving backward compatibility.
+
+    Typical multi-instance workflow::
+
+        pool.connect("baseline", capture="clean_build")
+        pool.connect("broken",   capture="artifacts")
+        pool.send("eval", {"code": "..."}, alias="baseline")
+        pool.send("eval", {"code": "..."}, alias="broken")
+    """
+
+    def __init__(self):
+        # alias → RenderDocClient
+        self._connections : dict[str, RenderDocClient] = {}
+        # alias used when no instance= is specified; None means auto-select
+        self._default     : str | None                 = None
+
+    # --- Connection management ---
+
+    def connect(self, alias: str | None = None,
+                port: int | None = None,
+                capture: str | None = None) -> dict:
+        """Connect to a RenderDoc instance and register it under an alias.
+
+        Exactly one of port or capture must be provided.
+
+        port    -- TCP port to connect to directly.
+        capture -- Substring matched (case-insensitive) against the
+                   capture_path reported by each running instance. Raises
+                   ValueError if zero or more than one instance matches.
+        alias   -- Name for this connection. Auto-derived from the capture
+                   filename stem if omitted.
+
+        Returns the instance_info dict for the connected instance, with
+        an added "alias" key.
+        """
+        if port is None and capture is None:
+            raise ValueError("provide port= or capture=")
+        if port is not None and capture is not None:
+            raise ValueError("provide port= or capture=, not both")
+
+        if capture is not None:
+            port = self._find_port_by_capture(capture)
+
+        client = RenderDocClient()
+        client.connect(port)
+
+        try:
+            resp = client.send("instance_info", {})
+            info = resp.get("data", {}) if resp.get("ok") else {}
+        except (ConnectionError, OSError):
+            info = {}
+
+        if alias is None:
+            alias = _alias_from_info(info, port)
+            # Avoid clobbering an existing alias with the same auto-name.
+            alias = self._unique_alias(alias)
+
+        # Replace any existing connection under this alias.
+        if alias in self._connections:
+            try:
+                self._connections[alias].disconnect()
+            except Exception:
+                pass
+
+        self._connections[alias] = client
+
+        # First connection becomes the default automatically.
+        if self._default is None or self._default not in self._connections:
+            self._default = alias
+
+        return {**info, "alias": alias}
+
+    def disconnect(self, alias: str) -> None:
+        """Close and remove the named connection.
+
+        If the disconnected alias was the default, the default is cleared
+        (auto-selected on next send if only one connection remains).
+        """
+        client = self._connections.pop(alias, None)
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+
+        if self._default == alias:
+            self._default = None
+
+    def set_default(self, alias: str) -> None:
+        """Set the alias used when no instance= is specified."""
+        if alias not in self._connections:
+            raise KeyError(f"no connection named {alias!r}")
+        self._default = alias
+
+    def send(self, cmd: str, params: dict,
+             alias: str | None = None) -> dict:
+        """Send a command to a named (or default) connection.
+
+        alias -- Target connection. If None, uses the explicit default or
+                 the sole active connection. Raises if the target is
+                 ambiguous (multiple connections, no default set).
+        """
+        client = self._resolve(alias)
+        return client.send(cmd, params)
+
+    # --- Discovery ---
+
+    def discover_instances(self, enrich: bool = True) -> list[dict]:
+        """Probe the port range and return all running instances.
+
+        Annotates each entry with its alias if it is already connected.
+        """
+        probe = RenderDocClient()
+        raw   = probe.discover_instances(enrich=enrich)
+
+        port_to_alias = {
+            c._port: a for a, c in self._connections.items()
+            if c._port is not None
+        }
+
+        for entry in raw:
+            p = entry.get("port")
+            if p in port_to_alias:
+                entry["alias"] = port_to_alias[p]
+
+        return raw
+
+    # --- Status ---
+
+    @property
+    def aliases(self) -> list[str]:
+        """List of all active connection aliases."""
+        return list(self._connections.keys())
+
+    @property
+    def default_alias(self) -> str | None:
+        """The current default alias, or None if unset."""
+        # Auto-select if exactly one connection exists.
+        if self._default is None and len(self._connections) == 1:
+            return next(iter(self._connections))
+        return self._default
+
+    def connection_info(self) -> list[dict]:
+        """Summary of all active connections (alias, port, capture_path)."""
+        result = []
+        for alias, client in self._connections.items():
+            entry = {"alias": alias, "port": client._port}
+            if client._conn_info:
+                entry.update(client._conn_info)
+            result.append(entry)
+        return result
+
+    # --- Internal helpers ---
+
+    def _resolve(self, alias: str | None) -> RenderDocClient:
+        """Return the client for the given alias, or the default."""
+        if not self._connections:
+            raise ConnectionError(
+                "no RenderDoc connections; "
+                "use Instance(action='connect') first"
+            )
+
+        target = alias or self.default_alias
+
+        if target is None:
+            names = ", ".join(repr(a) for a in self._connections)
+            raise ConnectionError(
+                f"multiple instances connected ({names}); "
+                f"specify instance= or use Instance(action='set_default')"
+            )
+
+        if target not in self._connections:
+            raise KeyError(
+                f"no connection named {target!r}; "
+                f"available: {list(self._connections)}"
+            )
+
+        return self._connections[target]
+
+    def _find_port_by_capture(self, capture: str) -> int:
+        """Find the port of an instance whose capture path matches capture.
+
+        Matches case-insensitively as a substring of the capture_path.
+        Raises ValueError if zero or more than one instance matches.
+        """
+        needle  = capture.lower()
+        matches = []
+
+        for entry in self.discover_instances(enrich=True):
+            path = entry.get("capture_path") or ""
+            if needle in path.lower():
+                matches.append(entry["port"])
+
+        if not matches:
+            raise ValueError(
+                f"no running RenderDoc instance has {capture!r} "
+                f"in its capture path"
+            )
+        if len(matches) > 1:
+            raise ValueError(
+                f"ambiguous: {len(matches)} instances match {capture!r} "
+                f"(ports {matches}); use port= to specify directly"
+            )
+
+        return matches[0]
+
+    def _unique_alias(self, base: str) -> str:
+        """Return base, or base_2, base_3, ... to avoid collisions."""
+        if base not in self._connections:
+            return base
+        i = 2
+        while f"{base}_{i}" in self._connections:
+            i += 1
+        return f"{base}_{i}"
