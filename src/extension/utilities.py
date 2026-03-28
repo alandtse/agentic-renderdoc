@@ -923,6 +923,50 @@ def make_view_texture(ctx: Any) -> Callable[..., dict]:
     return view_texture
 
 
+def make_save_texture(ctx):
+    """Create a save_texture function bound to the given HandlerContext.
+
+    ctx -- HandlerContext with replay() access.
+    """
+    def save_texture(resource_id, path, mip=0, slice_index=0, event_id=None):
+        """Save a texture or render target to a PNG file on disk.
+
+        Runs on the replay thread via ctx.replay(). If event_id is given the
+        replay cursor is moved to that event first so pipeline-bound resources
+        reflect the correct state.
+
+        Returns the absolute path that was written so the caller (or an MCP
+        client with file-read access) can open the image directly.
+
+        resource_id  -- rd.ResourceId of the texture to save.
+        path         -- Destination file path (must end in .png).
+        mip          -- Mip level to export (default 0).
+        slice_index  -- Array slice / cube face to export (default 0).
+        event_id     -- If set, seek to this event before saving.
+        """
+        import os
+
+        def _save(controller):
+            if event_id is not None:
+                controller.SetFrameEvent(event_id, True)
+
+            save_data = rd.TextureSave()
+            save_data.resourceId = resource_id
+            save_data.destType = rd.FileType.PNG
+            save_data.mip = mip
+            save_data.slice.sliceIndex = slice_index
+            # Export all components; caller can channel-extract via channelExtract
+            # if they need a single-channel greyscale view.
+            save_data.channelExtract = -1
+
+            result = controller.SaveTexture(save_data, path)
+            return {"ok": result.OK(), "path": os.path.abspath(path)}
+
+        return ctx.replay(_save)
+
+    return save_texture
+
+
 def make_highlight_drawcall(ctx: Any) -> Callable[..., dict]:
     """Create a highlight_drawcall function bound to the given HandlerContext.
 
@@ -966,6 +1010,7 @@ def bind_utilities(ctx: Any) -> dict[str, Any]:
         "describe_draw"        : make_describe_draw(ctx),
         "goto_event"           : make_goto_event(ctx),
         "view_texture"         : make_view_texture(ctx),
+        "save_texture"         : make_save_texture(ctx),
         "highlight_drawcall"   : make_highlight_drawcall(ctx),
         "interpret_buffer"     : interpret_buffer,
         "summarize_data"       : summarize_data,

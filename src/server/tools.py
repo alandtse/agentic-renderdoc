@@ -255,6 +255,23 @@ def eval(code: str) -> dict:
         view_texture(resource_id)
             Open the texture viewer for a resource.
 
+        save_texture(resource_id, path, mip=0, slice_index=0, event_id=None)
+            Save a texture or render target to a PNG file on disk and return
+            {"ok": bool, "path": str}. The returned path can be passed
+            directly to the host's file-reading tool (e.g. Claude Code's
+            Read tool) for visual inspection — no Pillow dependency required.
+            Set event_id to seek the replay cursor before saving, which is
+            required when the resource is only bound as a render target at a
+            specific draw call. Useful for capturing stereo render targets by
+            saving each eye's output to separate paths and comparing visually.
+
+            Example — save both eyes of a stereo frame:
+                targets = state.GetOutputTargets()
+                save_texture(targets[0].resource, "/tmp/left_eye.png",
+                             event_id=eid)
+                save_texture(targets[1].resource, "/tmp/right_eye.png",
+                             event_id=eid)
+
         highlight_drawcall(eid)
             Alias for goto_event. Both call SetEventID under the hood.
             Use whichever name reads better in context.
