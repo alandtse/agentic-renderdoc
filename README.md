@@ -64,11 +64,20 @@ Available inside Eval code as functions, not separate tools.
 
 Copy `src/extension/` into RenderDoc's extensions directory as `agentic_renderdoc`:
 
-| Platform | Extensions directory |
-|---|---|
-| Windows | `%APPDATA%\qrenderdoc\extensions\` |
-| Linux | `~/.local/share/qrenderdoc/extensions/` |
-| macOS | `~/Library/Application Support/qrenderdoc/extensions/` |
+**Linux:**
+```bash
+cp -r src/extension ~/.local/share/qrenderdoc/extensions/agentic_renderdoc
+```
+
+**macOS:**
+```bash
+cp -r src/extension ~/Library/Application\ Support/qrenderdoc/extensions/agentic_renderdoc
+```
+
+**Windows (PowerShell):**
+```powershell
+Copy-Item -Recurse src\extension "$env:APPDATA\qrenderdoc\extensions\agentic_renderdoc"
+```
 
 Then in RenderDoc: **Tools > Manage Extensions**, enable `agentic-renderdoc`, and restart.
 
@@ -78,7 +87,7 @@ Then in RenderDoc: **Tools > Manage Extensions**, enable `agentic-renderdoc`, an
 python scripts/install.py
 ```
 
-This builds a wheel and installs it via pip.
+This builds a wheel and pip-installs the MCP server. It does not install the extension (step 1).
 
 ### 3. Configure Your MCP Client
 

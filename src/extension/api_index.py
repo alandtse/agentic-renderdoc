@@ -4,8 +4,11 @@ Introspects the live `renderdoc` module at startup to build a searchable
 index of all classes, methods, enums, and their docstrings.
 """
 
+from __future__ import annotations
+
 import inspect
 import re
+from typing import Any
 
 
 # --- Synonyms ---
@@ -109,7 +112,7 @@ _SYNONYMS = {
 
 # --- Public API ---
 
-def build_index():
+def build_index() -> list[dict]:
     """Build the API reference index by introspecting the renderdoc module.
 
     Returns a list of entries, each with:
@@ -128,7 +131,7 @@ def build_index():
     return entries
 
 
-def search_index(index, query):
+def search_index(index: list[dict], query: str) -> list[dict]:
     """Search the index for entries matching the query string.
 
     Matches against name and docstring content. Case-insensitive.
@@ -172,7 +175,7 @@ _CAMEL_SPLIT_RE = re.compile(
 )
 
 
-def _tokenize_name(name):
+def _tokenize_name(name: str) -> list[str]:
     """Split an API name into lowercase tokens by CamelCase and underscores.
 
     Handles PascalCase, camelCase, SCREAMING_SNAKE, and mixed identifiers.
@@ -190,7 +193,7 @@ def _tokenize_name(name):
     return tokens
 
 
-def _tokenize_query(query):
+def _tokenize_query(query: str) -> list[str]:
     """Split a search query into lowercase tokens.
 
     Handles both natural language ("pipeline state") and identifier-style
@@ -210,7 +213,7 @@ def _tokenize_query(query):
 
 # --- Edit Distance ---
 
-def _edit_distance(a, b):
+def _edit_distance(a: str, b: str) -> int:
     """Compute the Levenshtein edit distance between two strings.
 
     Standard dynamic programming implementation. O(len(a) * len(b)) time
@@ -243,7 +246,7 @@ def _edit_distance(a, b):
 
 # --- Scoring ---
 
-def _score_entry(entry, query_lower):
+def _score_entry(entry: dict, query_lower: str) -> int:
     """Score a single index entry against a lowercased query string.
 
     Returns an integer score. Zero means no match.
@@ -269,7 +272,7 @@ def _score_entry(entry, query_lower):
     return best
 
 
-def _score_query(entry, query_lower):
+def _score_query(entry: dict, query_lower: str) -> int:
     """Score a single index entry against a single lowercased search term.
 
     Returns an integer score. Zero means no match.
@@ -321,7 +324,7 @@ def _score_query(entry, query_lower):
     return 0
 
 
-def _score_tokens(query_tokens, name_tokens):
+def _score_tokens(query_tokens: list[str], name_tokens: list[str]) -> int:
     """Score query tokens against name tokens.
 
     Returns 50 if all query tokens exactly match a name token, 45 if all
@@ -371,7 +374,7 @@ def _score_tokens(query_tokens, name_tokens):
     return 0
 
 
-def _score_fuzzy(entry, query_lower):
+def _score_fuzzy(entry: dict, query_lower: str) -> int:
     """Score an entry using edit distance as a last resort.
 
     Only called when no other scoring method produced a match. Compares
@@ -405,7 +408,7 @@ def _score_fuzzy(entry, query_lower):
 
 # --- Module Walker ---
 
-def _walk_module(obj, prefix, entries, visited):
+def _walk_module(obj: Any, prefix: str, entries: list[dict], visited: set[int]) -> None:
     """Recursively enumerate members of a module or class.
 
     Walks public attributes of obj, classifying each as a class, enum,
@@ -456,7 +459,7 @@ def _walk_module(obj, prefix, entries, visited):
             _walk_class(member, qualified, entries, visited)
 
 
-def _walk_class(cls, prefix, entries, visited):
+def _walk_class(cls: type, prefix: str, entries: list[dict], visited: set[int]) -> None:
     """Walk the members of a class, emitting methods and properties.
 
     Unlike _walk_module, this checks for property descriptors using
@@ -525,7 +528,7 @@ def _walk_class(cls, prefix, entries, visited):
             })
 
 
-def _walk_enum_members(enum_cls, prefix, entries):
+def _walk_enum_members(enum_cls: type, prefix: str, entries: list[dict]) -> None:
     """Extract individual values from a SWIG-generated enum type.
 
     SWIG enums expose their members via a __members__ dict mapping
@@ -561,7 +564,7 @@ def _walk_enum_members(enum_cls, prefix, entries):
 
 # --- Classification ---
 
-def _classify(obj):
+def _classify(obj: Any) -> str | None:
     """Classify a Python object as class, method, enum, or None.
 
     RenderDoc enums are SWIG-generated IntEnum-like types. They are
@@ -581,7 +584,7 @@ def _classify(obj):
         return None
 
 
-def _is_swig_enum(cls):
+def _is_swig_enum(cls: type) -> bool:
     """Check if a type is a SWIG-generated enum.
 
     SWIG enums are identified by either:
@@ -593,7 +596,7 @@ def _is_swig_enum(cls):
     return has_members or inherits_int
 
 
-def _is_property_descriptor(obj):
+def _is_property_descriptor(obj: Any) -> bool:
     """Check if an object is a property descriptor.
 
     Detects both builtin property objects and SWIG-style descriptors
@@ -618,7 +621,7 @@ def _is_property_descriptor(obj):
 
 # --- Signature Extraction ---
 
-def _get_signature(obj):
+def _get_signature(obj: Any) -> str | None:
     """Extract a signature string from a callable.
 
     Tries inspect.signature first. When that fails (common for
@@ -647,7 +650,7 @@ _SWIG_SIG_RE = re.compile(
 )
 
 
-def _parse_docstring_signature(obj):
+def _parse_docstring_signature(obj: Any) -> str | None:
     """Parse a signature from the first line of a SWIG-style docstring.
 
     Returns a signature string like "(arg1, arg2) -> ReturnType", or

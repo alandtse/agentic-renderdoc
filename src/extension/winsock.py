@@ -218,7 +218,7 @@ else:
         recv, close. Used as a context manager for automatic cleanup.
         """
 
-        def __init__(self, handle: int = None):
+        def __init__(self, handle: int | None = None):
             """Create a new TCP socket, or wrap an existing handle.
 
             Args:

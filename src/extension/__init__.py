@@ -3,8 +3,11 @@
 Registers the CaptureViewer and starts the TCP bridge server.
 RenderDoc calls register() on load and unregister() on shutdown.
 """
+from __future__ import annotations
 
 import threading
+from collections.abc import Callable
+from typing          import Any
 
 import qrenderdoc as qrd
 import renderdoc as rd
@@ -21,7 +24,7 @@ class _TrackedController:
     querying pipeline state without first selecting an event.
     """
 
-    def __init__(self, controller, warnings):
+    def __init__(self, controller: Any, warnings: list[str]) -> None:
         """Wrap a ReplayController and record warnings into the given list.
 
         controller -- The real rd.ReplayController instance.
@@ -34,12 +37,12 @@ class _TrackedController:
         # (like our inspect() utility) discover the real object.
         self.__wrapped__         = controller
 
-    def SetFrameEvent(self, *args, **kwargs):
+    def SetFrameEvent(self, *args: Any, **kwargs: Any) -> Any:
         """Record that an event was selected, then forward the call."""
         self._set_frame_called = True
         return self._controller.SetFrameEvent(*args, **kwargs)
 
-    def GetPipelineState(self, *args, **kwargs):
+    def GetPipelineState(self, *args: Any, **kwargs: Any) -> Any:
         """Warn if no event was selected, then forward the call."""
         if not self._set_frame_called:
             self._warnings.append(
@@ -49,11 +52,11 @@ class _TrackedController:
             )
         return self._controller.GetPipelineState(*args, **kwargs)
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> Any:
         """Forward everything else to the real controller."""
         return getattr(self._controller, name)
 
-    def __dir__(self):
+    def __dir__(self) -> list[str]:
         """Expose the wrapped controller's attributes for introspection."""
         names = set(dir(self._controller))
         names.update(super().__dir__())
@@ -68,37 +71,37 @@ class HandlerContext:
     _server_port after binding so handlers can report it.
     """
 
-    def __init__(self, ctx):
+    def __init__(self, ctx: Any) -> None:
         """Create a handler context.
 
         ctx -- qrenderdoc.CaptureContext from the host.
         """
-        self.ctx                = ctx
-        self._server_port       = 0
-        self._capture_loaded    = False
-        self._api_type          = None
-        self._capture_path      = None
-        self._event_count       = 0
-        self._api_index         = None
-        self._replay_controller = None
-        self._replay_warnings   = []
+        self.ctx                              = ctx
+        self._server_port       : int         = 0
+        self._capture_loaded    : bool        = False
+        self._api_type          : Any         = None
+        self._capture_path      : str | None  = None
+        self._event_count       : int         = 0
+        self._api_index         : dict | None = None
+        self._replay_controller : Any         = None
+        self._replay_warnings   : list[str]   = []
 
     @property
-    def capture_loaded(self):
+    def capture_loaded(self) -> bool:
         """Whether a capture file is currently open."""
         return self._capture_loaded
 
     @property
-    def api_index(self):
+    def api_index(self) -> dict | None:
         """The pre-built API reference index, or None."""
         return self._api_index
 
     @property
-    def structured_file(self):
+    def structured_file(self) -> Any:
         """The capture's SDFile, needed for ActionDescription.GetName()."""
         return self.ctx.GetStructuredFile()
 
-    def on_capture_loaded(self):
+    def on_capture_loaded(self) -> None:
         """Update state when a capture is opened.
 
         Reads API type, capture path, and event count from the live
@@ -118,14 +121,14 @@ class HandlerContext:
         if self._api_index is None:
             self._api_index = build_index()
 
-    def on_capture_closed(self):
+    def on_capture_closed(self) -> None:
         """Reset capture-dependent state when a capture is closed."""
         self._capture_loaded = False
         self._api_type       = None
         self._capture_path   = None
         self._event_count    = 0
 
-    def replay(self, callback):
+    def replay(self, callback: Callable[[Any], Any]) -> Any:
         """Execute callback on the replay thread with the ReplayController.
 
         Calls BlockInvoke from the bridge handler thread. The UI thread
@@ -168,7 +171,7 @@ class HandlerContext:
             raise exception[0]
         return result[0]
 
-    def invoke_ui(self, callback):
+    def invoke_ui(self, callback: Callable[[], None]) -> None:
         """Execute callback on the UI thread.
 
         Use for operations that touch the UI: SetEventID, opening
@@ -202,7 +205,7 @@ class AgenticExtension(qrd.CaptureViewer):
     events to the context.
     """
 
-    def __init__(self, ctx, handler_ctx):
+    def __init__(self, ctx: Any, handler_ctx: HandlerContext) -> None:
         """Create the extension viewer.
 
         ctx         -- qrenderdoc.CaptureContext from the host.
@@ -212,32 +215,32 @@ class AgenticExtension(qrd.CaptureViewer):
         self._ctx         = ctx
         self._handler_ctx = handler_ctx
 
-    def OnCaptureLoaded(self):
+    def OnCaptureLoaded(self) -> None:
         """Called by RenderDoc when a capture file is opened."""
         self._handler_ctx.on_capture_loaded()
         print("[Agentic] Capture loaded")
 
-    def OnCaptureClosed(self):
+    def OnCaptureClosed(self) -> None:
         """Called by RenderDoc when the capture is closed."""
         self._handler_ctx.on_capture_closed()
         print("[Agentic] Capture closed")
 
-    def OnSelectedEventChanged(self, event):
+    def OnSelectedEventChanged(self, event: int) -> None:
         """Called when the user selects a different event."""
         pass
 
-    def OnEventChanged(self, event):
+    def OnEventChanged(self, event: int) -> None:
         """Called when the viewed event changes."""
         pass
 
 
 # --- Module state ---
 
-_extension = None
-_server    = None
+_extension : AgenticExtension | None = None
+_server    : BridgeServer | None    = None
 
 
-def register(version, ctx):
+def register(version: str, ctx: Any) -> None:
     """Called by RenderDoc when the extension is loaded.
 
     Sets up the handler context, registers the CaptureViewer, and
@@ -263,7 +266,7 @@ def register(version, ctx):
         handler_ctx._server_port = _server.port
 
 
-def unregister():
+def unregister() -> None:
     """Called by RenderDoc when the extension is unloaded."""
     global _extension, _server
 

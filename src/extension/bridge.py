@@ -3,10 +3,12 @@
 Accepts JSON-lines requests over TCP and dispatches to handlers.
 Ported from orb-renderdoc v1.
 """
+from __future__ import annotations
 
 import json
 import threading
 import traceback
+from typing import Any
 
 from .handlers import HANDLERS
 from .          import winsock
@@ -21,7 +23,7 @@ class JsonSocket:
     JSON request or response.
     """
 
-    def __init__(self, conn):
+    def __init__(self, conn: Any) -> None:
         """Wrap a winsock.Socket for JSON-lines I/O.
 
         conn -- Connected winsock.Socket instance.
@@ -29,7 +31,7 @@ class JsonSocket:
         self._conn   = conn
         self._buffer = b""
 
-    def read_request(self):
+    def read_request(self) -> dict[str, Any] | None:
         """Read a single newline-delimited JSON request.
 
         Blocks until a complete line arrives. Returns the parsed dict,
@@ -47,7 +49,7 @@ class JsonSocket:
         line, self._buffer = self._buffer.split(b"\n", 1)
         return json.loads(line.decode("utf-8"))
 
-    def write_response(self, response):
+    def write_response(self, response: dict[str, Any]) -> None:
         """Write a JSON response followed by a newline."""
         data = json.dumps(response, separators=(",", ":")) + "\n"
         self._conn.sendall(data.encode("utf-8"))
@@ -60,7 +62,7 @@ class BridgeServer:
     dispatch lock (the replay API is single-threaded).
     """
 
-    def __init__(self, ctx, port_range=range(19876, 19886)):
+    def __init__(self, ctx: Any, port_range: range = range(19876, 19886)) -> None:
         """Create a bridge server.
 
         ctx        -- HandlerContext shared with all handlers.
@@ -68,20 +70,20 @@ class BridgeServer:
         """
         self._ctx              = ctx
         self._port_range       = port_range
-        self._port             = None
-        self._server_socket    = None
-        self._running          = False
-        self._thread           = None
-        self._active_conns     = 0
-        self._conn_lock        = threading.Lock()
-        self._dispatch_lock    = threading.Lock()
+        self._port             : int | None            = None
+        self._server_socket    : Any                   = None
+        self._running          : bool                  = False
+        self._thread           : threading.Thread | None = None
+        self._active_conns     : int                   = 0
+        self._conn_lock                                = threading.Lock()
+        self._dispatch_lock                            = threading.Lock()
 
     @property
-    def port(self):
+    def port(self) -> int | None:
         """The port the server is listening on, or None if not started."""
         return self._port
 
-    def start(self):
+    def start(self) -> None:
         """Bind to the first available port and start accepting connections.
 
         Tries each port in the configured range. Skips SO_REUSEADDR on
@@ -118,7 +120,7 @@ class BridgeServer:
         self._thread = threading.Thread(target=self._accept_loop, daemon=True)
         self._thread.start()
 
-    def stop(self):
+    def stop(self) -> None:
         """Shut down the server and close all connections."""
         self._running = False
 
@@ -135,7 +137,7 @@ class BridgeServer:
 
         print("[Agentic] Server stopped")
 
-    def _accept_loop(self):
+    def _accept_loop(self) -> None:
         """Accept connections and spawn a handler thread for each."""
         while self._running:
             try:
@@ -158,7 +160,7 @@ class BridgeServer:
                     traceback.print_exc()
                 break
 
-    def _handle_connection(self, sock):
+    def _handle_connection(self, sock: Any) -> None:
         """Handle a single client connection (runs in its own thread).
 
         Reads JSON-lines requests, dispatches each through _dispatch,
@@ -186,7 +188,7 @@ class BridgeServer:
 
             print(f"[Agentic] Connection closed ({count} active)")
 
-    def _dispatch(self, request):
+    def _dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
         """Dispatch a request to the appropriate handler.
 
         Serializes all handler invocations through _dispatch_lock so

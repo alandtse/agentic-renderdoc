@@ -1,5 +1,7 @@
 """MCP tool definitions for eval, search_api, instance, and get_texture."""
 
+from __future__ import annotations
+
 import base64
 import io
 import json
@@ -601,7 +603,7 @@ def get_texture(
     ]
 
 
-def _decode_texture(raw, width, height, fmt, black_point, white_point):
+def _decode_texture(raw: bytes, width: int, height: int, fmt: dict, black_point: float, white_point: float) -> PILImage.Image | None:
     """Decode raw texture bytes into a Pillow Image.
 
     Handles RGBA/BGRA 8-bit, half-float, and float formats. Applies

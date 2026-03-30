@@ -4,12 +4,16 @@ Converts RenderDoc's SWIG-wrapped types into plain dicts suitable for
 JSON transport. Ported from orb-renderdoc v1.
 """
 
+from __future__ import annotations
+
+from typing import Any
+
 import renderdoc as rd
 
 
 # --- Helpers ---
 
-def _enum_name(value):
+def _enum_name(value: Any) -> str:
     """Extract the name string from a SWIG enum value.
 
     SWIG enum wrappers sometimes expose `.name` (like Python enums) and
@@ -57,7 +61,7 @@ def api_properties(props: rd.APIProperties) -> dict:
 
 # --- Actions ---
 
-def action_flags(flags: rd.ActionFlags) -> list:
+def action_flags(flags: rd.ActionFlags) -> list[str]:
     """Convert an ActionFlags bitmask to a list of flag name strings."""
     result = []
 
@@ -578,7 +582,7 @@ def shader_reflection(refl: rd.ShaderReflection) -> dict:
 
 # --- Constant Buffer Data ---
 
-def cbuffer_variables(variables, data: bytes) -> list:
+def cbuffer_variables(variables: Any, data: bytes) -> list:
     """Serialize constant buffer variables with their current values.
 
     Reads raw buffer data and unpacks each variable according to its
