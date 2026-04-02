@@ -11,6 +11,7 @@ Ported from orb-renderdoc v1. IPv4 loopback only.
 """
 
 import sys
+from typing import Optional
 
 
 # --- Platform dispatch ---
@@ -218,7 +219,7 @@ else:
         recv, close. Used as a context manager for automatic cleanup.
         """
 
-        def __init__(self, handle: int | None = None):
+        def __init__(self, handle: Optional[int] = None):
             """Create a new TCP socket, or wrap an existing handle.
 
             Args:

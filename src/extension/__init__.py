@@ -3,11 +3,8 @@
 Registers the CaptureViewer and starts the TCP bridge server.
 RenderDoc calls register() on load and unregister() on shutdown.
 """
-from __future__ import annotations
-
 import threading
-from collections.abc import Callable
-from typing          import Any
+from typing import Any, Callable, List, Optional
 
 import qrenderdoc as qrd
 import renderdoc as rd
@@ -24,7 +21,7 @@ class _TrackedController:
     querying pipeline state without first selecting an event.
     """
 
-    def __init__(self, controller: Any, warnings: list[str]) -> None:
+    def __init__(self, controller: Any, warnings: List[str]) -> None:
         """Wrap a ReplayController and record warnings into the given list.
 
         controller -- The real rd.ReplayController instance.
@@ -56,7 +53,7 @@ class _TrackedController:
         """Forward everything else to the real controller."""
         return getattr(self._controller, name)
 
-    def __dir__(self) -> list[str]:
+    def __dir__(self) -> List[str]:
         """Expose the wrapped controller's attributes for introspection."""
         names = set(dir(self._controller))
         names.update(super().__dir__())
@@ -80,11 +77,11 @@ class HandlerContext:
         self._server_port       : int         = 0
         self._capture_loaded    : bool        = False
         self._api_type          : Any         = None
-        self._capture_path      : str | None  = None
-        self._event_count       : int         = 0
-        self._api_index         : dict | None = None
-        self._replay_controller : Any         = None
-        self._replay_warnings   : list[str]   = []
+        self._capture_path      : Optional[str]  = None
+        self._event_count       : int             = 0
+        self._api_index         : Optional[dict]  = None
+        self._replay_controller : Any             = None
+        self._replay_warnings   : List[str]       = []
 
     @property
     def capture_loaded(self) -> bool:
@@ -92,7 +89,7 @@ class HandlerContext:
         return self._capture_loaded
 
     @property
-    def api_index(self) -> dict | None:
+    def api_index(self) -> Optional[dict]:
         """The pre-built API reference index, or None."""
         return self._api_index
 
@@ -236,8 +233,8 @@ class AgenticExtension(qrd.CaptureViewer):
 
 # --- Module state ---
 
-_extension : AgenticExtension | None = None
-_server    : BridgeServer | None    = None
+_extension = None  # type: Optional[AgenticExtension]
+_server    = None  # type: Optional[BridgeServer]
 
 
 def register(version: str, ctx: Any) -> None:

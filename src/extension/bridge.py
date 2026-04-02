@@ -3,12 +3,10 @@
 Accepts JSON-lines requests over TCP and dispatches to handlers.
 Ported from orb-renderdoc v1.
 """
-from __future__ import annotations
-
 import json
 import threading
 import traceback
-from typing import Any
+from typing import Any, Dict, Optional
 
 from .handlers import HANDLERS
 from .          import winsock
@@ -31,7 +29,7 @@ class JsonSocket:
         self._conn   = conn
         self._buffer = b""
 
-    def read_request(self) -> dict[str, Any] | None:
+    def read_request(self) -> Optional[Dict[str, Any]]:
         """Read a single newline-delimited JSON request.
 
         Blocks until a complete line arrives. Returns the parsed dict,
@@ -49,7 +47,7 @@ class JsonSocket:
         line, self._buffer = self._buffer.split(b"\n", 1)
         return json.loads(line.decode("utf-8"))
 
-    def write_response(self, response: dict[str, Any]) -> None:
+    def write_response(self, response: Dict[str, Any]) -> None:
         """Write a JSON response followed by a newline."""
         data = json.dumps(response, separators=(",", ":")) + "\n"
         self._conn.sendall(data.encode("utf-8"))
@@ -70,16 +68,16 @@ class BridgeServer:
         """
         self._ctx              = ctx
         self._port_range       = port_range
-        self._port             : int | None            = None
-        self._server_socket    : Any                   = None
-        self._running          : bool                  = False
-        self._thread           : threading.Thread | None = None
+        self._port             : Optional[int]              = None
+        self._server_socket    : Any                        = None
+        self._running          : bool                       = False
+        self._thread           : Optional[threading.Thread] = None
         self._active_conns     : int                   = 0
         self._conn_lock                                = threading.Lock()
         self._dispatch_lock                            = threading.Lock()
 
     @property
-    def port(self) -> int | None:
+    def port(self) -> Optional[int]:
         """The port the server is listening on, or None if not started."""
         return self._port
 
@@ -188,7 +186,7 @@ class BridgeServer:
 
             print(f"[Agentic] Connection closed ({count} active)")
 
-    def _dispatch(self, request: dict[str, Any]) -> dict[str, Any]:
+    def _dispatch(self, request: Dict[str, Any]) -> Dict[str, Any]:
         """Dispatch a request to the appropriate handler.
 
         Serializes all handler invocations through _dispatch_lock so
