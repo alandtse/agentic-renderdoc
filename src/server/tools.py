@@ -663,20 +663,24 @@ def search_api(query: str, instance: str | None = None) -> dict:
 
 @mcp.tool(name="Get-Texture")
 def get_texture(
-    resource_id  : str,
-    event_id     : int | None = None,
-    mip          : int   = 0,
-    slice        : int   = 0,
-    sample       : int   = 0,
-    max_size     : int   = 2048,
-    region_x     : int | None = None,
-    region_y     : int | None = None,
-    region_w     : int | None = None,
-    region_h     : int | None = None,
-    channel      : int   = -1,
-    black_point  : float = 0.0,
-    white_point  : float = 1.0,
-    instance     : str | None = None,
+    resource_id      : str,
+    event_id         : int | None = None,
+    mip              : int   = 0,
+    slice            : int   = 0,
+    sample           : int   = 0,
+    max_size         : int   = 2048,
+    region_x         : int | None = None,
+    region_y         : int | None = None,
+    region_w         : int | None = None,
+    region_h         : int | None = None,
+    channel          : int   = -1,
+    black_point      : float = 0.0,
+    white_point      : float = 1.0,
+    instance         : str | None = None,
+    compare_with     : str | None = None,
+    compare_event_id : int | None = None,
+    compare_instance : str | None = None,
+    diff_amplify     : float = 4.0,
 ) -> list:
     """Capture a texture or render target as a viewable image.
 
@@ -718,6 +722,30 @@ def get_texture(
                  0.0). For HDR textures, values below this are clamped.
     white_point: High end of the value range mapped to white (default
                  1.0). For HDR textures, values above this are clamped.
+
+    compare_with:     Optional second resource_id. When set, both
+                      textures are fetched and post-processed identically
+                      (same channel / region / black_point / white_point),
+                      and the response contains FOUR content blocks:
+                      a JSON summary with diff statistics, then the A,
+                      B, and a per-pixel absolute-difference image
+                      (amplified for visibility). Use this for stereo
+                      left-vs-right comparison, baseline-vs-broken
+                      render-target diffs, or before/after stages of a
+                      post-process chain. If A and B differ in size, B
+                      is resized to A's dimensions.
+    compare_event_id: Event ID to seek before fetching the comparison
+                      texture. Defaults to event_id (same event, useful
+                      for paired-output stereo render targets).
+    compare_instance: Pool alias of the connection to fetch B from.
+                      Defaults to instance. Set to a different alias to
+                      diff between two captures (the killer use case for
+                      ConnectionPool — baseline vs broken).
+    diff_amplify:     Multiplier applied to the absolute-difference image
+                      before clamping to 0-255. Default 4.0 — small
+                      differences become visible. Set 1.0 for no
+                      amplification, or 0 to disable the diff image
+                      (stats still computed).
     """
     if not _pool.aliases:
         try:
@@ -725,6 +753,73 @@ def get_texture(
         except ConnectionError as e:
             return [TextContent(type="text", text=json.dumps(
                 {"ok": False, "error": str(e)}))]
+
+    img_a, meta_a, err = _fetch_and_decode_texture(
+        resource_id, event_id, mip, slice, sample, max_size,
+        region_x, region_y, region_w, region_h,
+        channel, black_point, white_point, instance,
+    )
+    if err is not None:
+        return [TextContent(type="text", text=json.dumps(err))]
+
+    if compare_with is None:
+        buf = io.BytesIO()
+        img_a.save(buf, format="PNG")
+        return [
+            TextContent(type="text", text=json.dumps(meta_a, indent=2)),
+            MCPImage(data=buf.getvalue(), format="png").to_image_content(),
+        ]
+
+    # --- Compare path ---
+    img_b, meta_b, err = _fetch_and_decode_texture(
+        compare_with,
+        compare_event_id if compare_event_id is not None else event_id,
+        mip, slice, sample, max_size,
+        region_x, region_y, region_w, region_h,
+        channel, black_point, white_point,
+        compare_instance if compare_instance is not None else instance,
+    )
+    if err is not None:
+        return [TextContent(type="text", text=json.dumps(err))]
+
+    # Resize B to A if needed for pixel-wise diff.
+    if img_b.size != img_a.size:
+        img_b_resized = img_b.resize(img_a.size, PILImage.Resampling.LANCZOS)
+    else:
+        img_b_resized = img_b
+
+    diff_img, diff_stats = _diff_images(img_a, img_b_resized, diff_amplify)
+
+    summary = {
+        "a"     : meta_a,
+        "b"     : meta_b,
+        "diff"  : diff_stats,
+    }
+
+    blocks = [TextContent(type="text", text=json.dumps(summary, indent=2))]
+    for label, im in (("A", img_a), ("B", img_b)):
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        blocks.append(TextContent(type="text", text=label))
+        blocks.append(MCPImage(data=buf.getvalue(), format="png").to_image_content())
+    if diff_img is not None:
+        buf = io.BytesIO()
+        diff_img.save(buf, format="PNG")
+        blocks.append(TextContent(type="text", text="diff (|A - B| x {:g})".format(diff_amplify)))
+        blocks.append(MCPImage(data=buf.getvalue(), format="png").to_image_content())
+    return blocks
+
+
+def _fetch_and_decode_texture(
+    resource_id, event_id, mip, slice, sample, max_size,
+    region_x, region_y, region_w, region_h,
+    channel, black_point, white_point, instance,
+):
+    """Fetch a texture through the pool, decode + post-process to a Pillow Image.
+
+    Returns (image, metadata, error). On any failure image is None and
+    error is a dict suitable for returning to the client.
+    """
     resp = _pool.send("get_texture", {
         "resource_id" : resource_id,
         "event_id"    : event_id,
@@ -734,10 +829,7 @@ def get_texture(
     }, alias=instance)
 
     if not resp.get("ok"):
-        return [TextContent(
-            type = "text",
-            text = json.dumps(resp),
-        )]
+        return None, None, resp
 
     data     = resp["data"]
     raw      = base64.b64decode(data["raw"])
@@ -745,34 +837,30 @@ def get_texture(
     width    = data["mip_width"]
     height   = data["mip_height"]
     metadata = {k: v for k, v in data.items() if k != "raw"}
+    metadata["resource_id"] = resource_id
+    if event_id is not None:
+        metadata["event_id"] = event_id
 
-    # Decode raw GPU bytes into a Pillow Image.
     img = _decode_texture(raw, width, height, fmt, black_point, white_point)
     if img is None:
         fmt_name = fmt.get("name", "unknown")
-        return [TextContent(
-            type = "text",
-            text = json.dumps({
-                "ok"    : False,
-                "error" : f"unsupported texture format: {fmt_name}. use RenderDoc's texture viewer instead.",
-            }),
-        )]
+        return None, None, {
+            "ok"    : False,
+            "error" : f"unsupported texture format: {fmt_name}. use RenderDoc's texture viewer instead.",
+        }
 
-    # Extract single channel as grayscale.
     if channel >= 0:
         bands = img.split()
         if channel < len(bands):
             img = bands[channel].convert("L")
             metadata["channel_extracted"] = channel
 
-    # Crop subregion.
     has_region = all(v is not None for v in (region_x, region_y, region_w, region_h))
     if has_region:
         box = (region_x, region_y, region_x + region_w, region_y + region_h)
         img = img.crop(box)
         metadata["region"] = {"x": region_x, "y": region_y, "w": region_w, "h": region_h}
 
-    # Downscale if the image exceeds max_size on either axis.
     if max_size > 0:
         w, h = img.size
         if w > max_size or h > max_size:
@@ -781,17 +869,59 @@ def get_texture(
             img          = img.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
             metadata["scaled"] = {"from": [w, h], "to": [new_w, new_h]}
 
-    # Encode to PNG.
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    png_bytes = buf.getvalue()
+    return img, metadata, None
 
-    metadata_text = json.dumps(metadata, indent=2)
 
-    return [
-        TextContent(type="text", text=metadata_text),
-        MCPImage(data=png_bytes, format="png").to_image_content(),
-    ]
+def _diff_images(img_a, img_b, amplify):
+    """Compute |A - B| per pixel and return (diff_image, stats).
+
+    diff_amplify multiplies the per-pixel delta before clamping to 0-255
+    so subtle differences are visible. amplify <= 0 disables the diff
+    image (stats are still computed).
+    """
+    from PIL import ImageChops
+
+    # Coerce to a common mode (RGBA preferred so we don't lose alpha).
+    if img_a.mode != img_b.mode:
+        target = "RGBA" if "A" in img_a.mode or "A" in img_b.mode else "RGB"
+        a = img_a.convert(target)
+        b = img_b.convert(target)
+    else:
+        a, b = img_a, img_b
+
+    raw_diff = ImageChops.difference(a, b)
+
+    # Stats: max delta + percent of pixels that differ at all.
+    extrema = raw_diff.getextrema()
+    # extrema is per-band [(min,max), …] for multiband images, or (min,max) for L.
+    if isinstance(extrema[0], tuple):
+        max_delta = max(hi for _, hi in extrema)
+    else:
+        max_delta = extrema[1]
+
+    # Percent of pixels with any non-zero channel.
+    if raw_diff.mode == "L":
+        flat = raw_diff.point(lambda v: 255 if v > 0 else 0)
+    else:
+        flat = raw_diff.convert("L").point(lambda v: 255 if v > 0 else 0)
+    nonzero = sum(1 for px in flat.getdata() if px > 0)
+    total   = flat.width * flat.height
+    pct     = (100.0 * nonzero / total) if total else 0.0
+
+    stats = {
+        "max_delta"          : int(max_delta),
+        "pixels_changed"     : nonzero,
+        "pixels_total"       : total,
+        "pixels_changed_pct" : round(pct, 4),
+        "size"               : list(a.size),
+        "size_mismatch"      : list(img_a.size) != list(img_b.size),
+    }
+
+    if amplify <= 0:
+        return None, stats
+
+    scaled = raw_diff.point(lambda v: min(255, int(v * amplify)))
+    return scaled, stats
 
 
 def _decode_texture(raw: bytes, width: int, height: int, fmt: dict, black_point: float, white_point: float) -> PILImage.Image | None:
