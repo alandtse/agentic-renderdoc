@@ -1,4 +1,20 @@
-"""TCP client for communicating with the RenderDoc extension."""
+"""TCP client + connection pool for the RenderDoc bridge extension.
+
+Two layers:
+
+  RenderDocClient -- One JSON-lines TCP connection to one bridge port.
+                     Owns the socket and the send/retry/timeout logic.
+                     May hold an optional worker Popen reference so its
+                     send-side liveness checks can report whether the
+                     port belongs to a spawned worker.
+
+  ConnectionPool  -- Named registry of RenderDocClient instances. Owns
+                     headless-worker subprocess lifecycle (spawn / close
+                     / reap) so workers and their bridge connections are
+                     managed in lockstep under one alias. Routes send()
+                     by alias; auto-resolves when exactly one connection
+                     is active.
+"""
 
 import json
 import os
@@ -8,6 +24,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing  import Dict, List, Optional
 
 
 # Port range matching the extension's BridgeServer.
@@ -25,7 +42,7 @@ _WORKER_GRACE_SECS  = 5.0
 # frame replay — capture-size dependent, but rarely longer than ~60s in
 # practice. Cheap metadata calls finish in milliseconds; 10s is plenty.
 _DEFAULT_READ_TIMEOUT = 10.0
-_READ_TIMEOUTS: dict[str, float] = {
+_READ_TIMEOUTS: Dict[str, float] = {
     "eval"        : 90.0,
     "get_texture" : 90.0,
 }
@@ -39,7 +56,7 @@ def _format_timeout_error(e: "WorkerTimeoutError") -> dict:
             f"did not respond within {e.timeout:.0f}s — likely a hung "
             "SetFrameEvent or replay-driver wait that cannot be cancelled",
             f"force-terminate it with Instance(action='close', "
-            f"port={e.port}, force=True), then re-open the capture with "
+            f"alias=..., force=True), then re-open the capture with "
             "Instance(action='open', file=...)",
         ]
     else:
@@ -150,7 +167,7 @@ class WorkerTimeoutError(TimeoutError):
         cmd        : str,
         timeout    : float,
         is_spawned : bool,
-        pid        : int | None,
+        pid        : Optional[int],
     ) -> None:
         super().__init__(
             f"worker on port {port} did not respond to {cmd!r} within {timeout}s"
@@ -172,8 +189,8 @@ class WorkerDeadError(ConnectionError):
         port       : int,
         cmd        : str,
         is_spawned : bool,
-        pid        : int | None,
-        original   : Exception | None,
+        pid        : Optional[int],
+        original   : Optional[Exception],
     ) -> None:
         super().__init__(
             f"worker on port {port} is unreachable for {cmd!r}: {original}"
@@ -186,28 +203,33 @@ class WorkerDeadError(ConnectionError):
 
 
 class RenderDocClient:
-    """JSON-lines TCP client that talks to the RenderDoc bridge extension.
+    """JSON-lines TCP client that talks to one RenderDoc bridge port.
 
-    Supports auto-discovery of running RenderDoc instances, auto-reconnect
-    on connection failures, and optional enrichment of instance metadata.
-    Also owns the subprocess handles for any headless workers it spawned
-    so they can be terminated cleanly.
+    Single-connection abstraction: one client holds at most one open
+    socket to one port. Auto-discovery and worker lifecycle live on
+    ConnectionPool — this class only handles the wire protocol, retries,
+    and per-command timeouts for its own socket.
+
+    A client may be associated with a Popen handle (set by ConnectionPool
+    when the connection points at a worker the pool spawned) so that
+    timeout/dead errors carry liveness info without the client having to
+    know about the pool's full bookkeeping.
     """
 
-    def __init__(self):
-        self._sock          : socket.socket | None = None
-        self._port          : int | None           = None
-        self._buffer        : str                  = ""
-        self._disconnected  : bool                 = False
-        self._instances     : list[dict] | None    = None
-        self._conn_info     : dict | None          = None
-        # port -> subprocess.Popen for headless workers we spawned.
-        self._spawned       : dict[int, subprocess.Popen] = {}
+    def __init__(self) -> None:
+        self._sock          = None       # type: Optional[socket.socket]
+        self._port          = None       # type: Optional[int]
+        self._buffer        = ""
+        self._worker_proc   = None       # type: Optional[subprocess.Popen]
+        # Cached instance_info from the most recent send(). Populated by
+        # ConnectionPool after a successful connect/open so callers can
+        # surface capture_path / api_type without re-querying.
+        self._info          = None       # type: Optional[dict]
 
     # --- Properties ---
 
     @property
-    def connected_port(self) -> int | None:
+    def connected_port(self) -> Optional[int]:
         """Return the port of the currently connected instance, or None."""
         return self._port
 
@@ -216,14 +238,23 @@ class RenderDocClient:
         """Return True if a connection is currently established."""
         return self._sock is not None
 
+    @property
+    def is_headless(self) -> bool:
+        """True if this client points at a worker spawned by the pool."""
+        return self._worker_proc is not None
+
     # --- Connection management ---
 
-    def connect(self, port: int):
+    def connect(self, port: int, worker_proc: Optional[subprocess.Popen] = None) -> None:
         """Connect to a RenderDoc instance on the given port.
 
         Closes any existing connection first, then opens a new TCP socket
-        to 127.0.0.1 on the specified port. Clears the disconnected flag
-        so that auto-reconnect in ensure_connected() works again.
+        to 127.0.0.1 on the specified port.
+
+        port        -- Bridge port to connect to.
+        worker_proc -- Optional Popen handle if the pool spawned this
+                       worker. Lets liveness checks during send-retry
+                       distinguish spawned-worker death from live-UI death.
         """
         self.disconnect()
 
@@ -232,146 +263,62 @@ class RenderDocClient:
         sock.connect(("127.0.0.1", port))
         sock.settimeout(None)
 
-        self._sock          = sock
-        self._port          = port
-        self._disconnected  = False
+        self._sock        = sock
+        self._port        = port
+        self._worker_proc = worker_proc
 
-    def disconnect(self):
+    def disconnect(self) -> None:
         """Close the current connection, if any.
 
-        Resets internal socket, port, and read buffer state. Sets the
-        disconnected flag to prevent ensure_connected() from silently
-        auto-reconnecting. Does not clear cached discovery or connection
-        info. Call connect() to reconnect.
+        Does NOT terminate any associated worker process — that lives on
+        ConnectionPool and is intentionally orthogonal to dropping the
+        socket. Use pool.close(alias) to stop the worker.
         """
         if self._sock is not None:
             try:
                 self._sock.close()
             except OSError:
                 pass
-            self._sock          = None
-            self._port          = None
-            self._buffer        = ""
-            self._disconnected  = True
-
-    def discover_instances(self, enrich: bool = False) -> list[dict]:
-        """Probe the port range for running RenderDoc instances.
-
-        Returns a list of dicts, each with at least a "port" key. When
-        enrich is True, connects to each discovered instance and sends an
-        instance_info command to merge richer metadata (capture path, API
-        type, event count) into each entry. Enrichment failures are
-        non-fatal; the instance is still included with just its port.
-
-        enrich -- If True, query each instance for metadata.
-        """
-        instances = []
-
-        for port in _PORT_RANGE:
-            info = self._probe_port(port, enrich=enrich)
-            if info is not None:
-                instances.append(info)
-
-        return instances
-
-    def ensure_connected(self) -> dict:
-        """Auto-connect to the first available instance if not connected.
-
-        On first use, discovers all running instances, connects to the
-        first one, queries its instance_info, and caches the results.
-        Subsequent calls while connected return the cached info.
-
-        Raises ConnectionError if a prior disconnect() has not been
-        followed by an explicit connect(). This prevents send() from
-        silently reconnecting after the user explicitly disconnected.
-
-        Returns a dict with:
-            port      -- The port connected to.
-            info      -- instance_info data from the connected instance.
-            others    -- List of other available instances (port dicts).
-        """
-        if self._disconnected:
-            raise ConnectionError(
-                "disconnected; use instance(action='connect') to reconnect"
-            )
-
-        if self._sock is not None:
-            return {
-                "port"   : self._port,
-                "info"   : self._conn_info,
-                "others" : [
-                    inst for inst in (self._instances or [])
-                    if inst.get("port") != self._port
-                ],
-            }
-
-        instances = self.discover_instances()
-        if not instances:
-            raise ConnectionError("no RenderDoc instances found")
-
-        self._instances = instances
-        self.connect(instances[0]["port"])
-
-        # Query the connected instance for metadata.
-        try:
-            resp            = self.send("instance_info", {})
-            self._conn_info = resp.get("data") if resp.get("ok") else None
-        except (ConnectionError, OSError, json.JSONDecodeError):
-            self._conn_info = None
-
-        others = [
-            inst for inst in instances
-            if inst.get("port") != self._port
-        ]
-
-        return {
-            "port"   : self._port,
-            "info"   : self._conn_info,
-            "others" : others,
-        }
+        self._sock        = None
+        self._port        = None
+        self._buffer      = ""
+        # Keep _worker_proc — the pool still owns it; we just dropped the socket.
 
     # --- Request / response ---
 
-    def send(self, cmd: str, params: dict) -> dict:
+    def send(self, cmd: str, params: dict,
+             read_timeout: Optional[float] = None) -> dict:
         """Send a command and return the parsed response.
 
-        Auto-connects if no connection is active. Connection-level
-        failures during send produce a structured error dict
-        (``{"ok": False, "error": {...}}``) rather than raising, so the
-        agent can react without a try/except in every tool.
+        Connection-level failures during send produce a structured error
+        dict (``{"ok": False, "error": {...}}``) rather than raising, so
+        the agent can react without a try/except in every tool.
 
         Behaviors by failure mode:
-          * Read timeout (worker didn't respond before the per-command
-            deadline) — single attempt, no retry. Returns a
-            ``worker_timeout`` error with hints to ``Instance(action=
-            'close', force=True)`` for spawned workers.
+          * Read timeout — single attempt, no retry. Returns a
+            ``worker_timeout`` error.
           * Connection refused / EOF — checks subprocess liveness for
-            spawned workers. If dead, untracks and returns
-            ``worker_dead``. If live (or unknown), reconnects once and
-            retries. If retry also fails, returns ``worker_dead``.
+            spawned workers. If dead, returns ``worker_dead``. Otherwise
+            reconnects once and retries.
 
-        Setup-level failures (no instances found, explicit disconnect)
-        still raise ``ConnectionError`` from ``ensure_connected``.
-
-        cmd    -- Command name (e.g. "eval", "instance_info").
-        params -- Command parameters dict.
+        cmd          -- Command name (e.g. "eval", "instance_info").
+        params       -- Command parameters dict.
+        read_timeout -- Override the per-command default deadline.
         """
-        self.ensure_connected()
-        assert self._sock is not None
+        if self._sock is None:
+            raise ConnectionError(
+                "not connected; pool must call connect() before send()"
+            )
 
         try:
-            return self._send_with_retry(cmd, params)
+            return self._send_with_retry(cmd, params, read_timeout)
         except WorkerTimeoutError as e:
             return _format_timeout_error(e)
         except WorkerDeadError as e:
             return _format_dead_error(e)
 
     def _read_response(self) -> dict:
-        """Read a newline-delimited JSON response.
-
-        Consumes data from the socket until a complete line is available
-        in the internal buffer. Returns the parsed JSON object.
-        """
+        """Read a newline-delimited JSON response."""
         assert self._sock is not None
 
         while "\n" not in self._buffer:
@@ -385,43 +332,31 @@ class RenderDocClient:
 
     # --- Internal helpers ---
 
-    def _send_with_retry(self, cmd: str, params: dict) -> dict:
-        """Execute a single send/recv with deadline + liveness-aware retry.
-
-        Read-timeout is final (no retry); the worker is just slow or
-        wedged, and a retry will hang again. Connection-level failures
-        retry once if the worker is still alive; otherwise the dead
-        worker is untracked and ``WorkerDeadError`` is raised.
-
-        cmd    -- Command name.
-        params -- Command parameters dict.
-        """
+    def _send_with_retry(self, cmd: str, params: dict,
+                         read_timeout: Optional[float]) -> dict:
+        """Execute a single send/recv with deadline + liveness-aware retry."""
         assert self._sock is not None
         assert self._port is not None
 
         port    = self._port
-        timeout = _READ_TIMEOUTS.get(cmd, _DEFAULT_READ_TIMEOUT)
+        timeout = read_timeout if read_timeout is not None \
+                  else _READ_TIMEOUTS.get(cmd, _DEFAULT_READ_TIMEOUT)
 
         try:
             return self._do_send(cmd, params, read_timeout=timeout)
         except TimeoutError:
-            # Worker is unresponsive but the connection is still open.
-            # No retry — a second attempt would just hang again.
             raise WorkerTimeoutError(
                 port       = port,
                 cmd        = cmd,
                 timeout    = timeout,
-                is_spawned = port in self._spawned,
-                pid        = self._spawned_pid(port),
+                is_spawned = self.is_headless,
+                pid        = self._worker_pid(),
             )
         except (ConnectionError, BrokenPipeError, OSError) as first_err:
-            # Connection-level failure. If the worker process is dead,
+            # Connection-level failure. If our worker process is dead,
             # don't bother retrying.
-            if not self._is_worker_alive(port):
-                pid = self._spawned_pid(port)
-                # Untrack a dead spawned worker so list/close behave
-                # consistently with reality.
-                self._spawned.pop(port, None)
+            if not self._is_worker_alive():
+                pid = self._worker_pid()
                 self.disconnect()
                 raise WorkerDeadError(
                     port       = port,
@@ -431,15 +366,14 @@ class RenderDocClient:
                     original   = first_err,
                 )
 
-            # Worker still appears alive; reconnect and retry once.
+            # Worker still appears alive (or unknown live UI); reconnect once.
+            saved_proc = self._worker_proc
             self.disconnect()
             try:
-                self.connect(port)
+                self.connect(port, worker_proc=saved_proc)
                 return self._do_send(cmd, params, read_timeout=timeout)
             except (ConnectionError, BrokenPipeError, OSError) as second_err:
-                pid = self._spawned_pid(port)
-                if pid is not None and not self._is_worker_alive(port):
-                    self._spawned.pop(port, None)
+                pid = self._worker_pid()
                 raise WorkerDeadError(
                     port       = port,
                     cmd        = cmd,
@@ -452,17 +386,12 @@ class RenderDocClient:
                     port       = port,
                     cmd        = cmd,
                     timeout    = timeout,
-                    is_spawned = port in self._spawned,
-                    pid        = self._spawned_pid(port),
+                    is_spawned = self.is_headless,
+                    pid        = self._worker_pid(),
                 )
 
     def _do_send(self, cmd: str, params: dict, read_timeout: float) -> dict:
-        """Perform the raw send and receive on the current socket.
-
-        cmd          -- Command name.
-        params       -- Command parameters dict.
-        read_timeout -- Seconds to wait for the response (per-command).
-        """
+        """Raw send and receive on the current socket."""
         assert self._sock is not None
 
         request = json.dumps({"cmd": cmd, "params": params}) + "\n"
@@ -473,218 +402,289 @@ class RenderDocClient:
         self._sock.settimeout(read_timeout)
         return self._read_response()
 
-    def _is_worker_alive(self, port: int) -> bool:
-        """True if the spawned worker on port is still alive (or unknown).
-
-        For workers we spawned, probes the subprocess via
-        ``os.kill(pid, 0)``. For unknown ports (e.g. a live RenderDoc
-        UI) we cannot tell, so default to True and let the retry path
-        decide.
-        """
-        proc = self._spawned.get(port)
+    def _is_worker_alive(self) -> bool:
+        """True if the associated worker is alive or unknown (live UI)."""
+        proc = self._worker_proc
         if proc is None:
             return True
-
         if proc.poll() is not None:
             return False
-
         try:
             os.kill(proc.pid, 0)
         except OSError:
             return False
         return True
 
-    def _spawned_pid(self, port: int) -> int | None:
-        """PID of the spawned worker on port, or None if not spawned by us."""
-        proc = self._spawned.get(port)
-        return proc.pid if proc is not None else None
+    def _worker_pid(self) -> Optional[int]:
+        """PID of the associated worker, or None if not headless."""
+        return self._worker_proc.pid if self._worker_proc is not None else None
 
-    def _probe_port(self, port: int, enrich: bool = False) -> dict | None:
-        """Probe a single port for a running RenderDoc instance.
 
-        Attempts a TCP connection to 127.0.0.1 on the given port. If the
-        connection succeeds and enrich is True, sends an instance_info
-        command over the probe socket and merges the response data into
-        the returned dict. The probe socket is always closed before
-        returning.
+# ---------------------------------------------------------------------------
+# Port discovery (module-level — pool and probes share this)
+# ---------------------------------------------------------------------------
 
-        Returns a dict with at least {"port": port} on success, or None
-        if the port is not reachable.
+def _probe_port(port: int, enrich: bool = False) -> Optional[dict]:
+    """Probe a single port for a running RenderDoc bridge.
 
-        port   -- TCP port to probe.
-        enrich -- If True, query instance_info over the probe connection.
-        """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(_PROBE_TIMEOUT)
+    Attempts a TCP connection to 127.0.0.1 on the given port. If the
+    connection succeeds and enrich is True, sends an instance_info
+    command and merges the response into the returned dict.
 
-        try:
-            sock.connect(("127.0.0.1", port))
-        except (ConnectionRefusedError, TimeoutError, OSError):
-            sock.close()
-            return None
+    Returns a dict with at least {"port": port} on success, or None if
+    the port is not reachable.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(_PROBE_TIMEOUT)
 
-        result = {"port": port}
-
-        if enrich:
-            result = self._enrich_instance(sock, result)
-
+    try:
+        sock.connect(("127.0.0.1", port))
+    except (ConnectionRefusedError, TimeoutError, OSError):
         sock.close()
+        return None
+
+    result = {"port": port}
+    if enrich:
+        result = _enrich_instance(sock, result)
+    sock.close()
+    return result
+
+
+def _enrich_instance(sock: socket.socket, instance: dict) -> dict:
+    """Query instance_info over an already-connected probe socket."""
+    try:
+        request = json.dumps({"cmd": "instance_info", "params": {}}) + "\n"
+
+        sock.settimeout(_ENRICH_TIMEOUT)
+        sock.sendall(request.encode("utf-8"))
+
+        buf = ""
+        while "\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                return instance
+            buf += chunk.decode("utf-8")
+
+        line = buf.split("\n", 1)[0]
+        resp = json.loads(line)
+
+        if resp.get("ok") and isinstance(resp.get("data"), dict):
+            merged = {**resp["data"], **instance}
+            return merged
+    except (ConnectionError, BrokenPipeError, OSError,
+            json.JSONDecodeError, UnicodeDecodeError):
+        pass
+
+    return instance
+
+
+def _first_free_port(port_range: range,
+                     exclude: Optional[set] = None) -> Optional[int]:
+    """First locally-bindable port in range, skipping exclude. None if all taken."""
+    excl = exclude or set()
+    for port in port_range:
+        if port in excl:
+            continue
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        finally:
+            s.close()
+        return port
+    return None
+
+
+def _wait_for_bridge(proc: subprocess.Popen, port: int,
+                     timeout: float) -> Optional[dict]:
+    """Block until the worker binds on port and answers instance_info."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if proc.poll() is not None:
+            return None
+        info = _probe_port(port, enrich=True)
+        if info is not None and info.get("capture_loaded"):
+            return info
+        time.sleep(0.25)
+    return None
+
+
+def _send_shutdown_to(port: int) -> None:
+    """One-shot shutdown command to a bridge on a specific port."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(_CONNECT_TIMEOUT)
+    s.connect(("127.0.0.1", port))
+    s.settimeout(_WRITE_TIMEOUT)
+    s.sendall(b'{"cmd":"shutdown","params":{}}\n')
+    s.settimeout(2.0)
+    try:
+        s.recv(1024)
+    except OSError:
+        pass
+    finally:
+        s.close()
+
+
+def _reap_proc(proc: subprocess.Popen) -> None:
+    """Politely terminate a Popen we don't intend to track."""
+    if proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=_WORKER_GRACE_SECS)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=_WORKER_GRACE_SECS)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# ConnectionPool — alias-routed registry of clients + spawned workers
+# ---------------------------------------------------------------------------
+
+def _alias_from_info(info: Optional[dict], port: int) -> str:
+    """Derive a default alias from instance_info data.
+
+    Uses the capture filename stem if a capture is loaded, otherwise
+    falls back to "port_<N>".
+    """
+    path = info.get("capture_path") if info else None
+    if path:
+        return os.path.splitext(os.path.basename(path))[0]
+    return "port_{}".format(port)
+
+
+class ConnectionPool:
+    """Named registry of RenderDoc connections and the workers they own.
+
+    Each connection is identified by a user-chosen alias. Commands are
+    routed to the appropriate instance by alias. When only one connection
+    is active it is used automatically.
+
+    Headless workers (spawned via ``open()``) are tracked alongside the
+    connection: closing an alias's connection does NOT kill its worker;
+    use ``close()`` for that. The connection and worker share an alias.
+    """
+
+    def __init__(self) -> None:
+        # alias -> RenderDocClient
+        self._connections = {}   # type: Dict[str, RenderDocClient]
+        # alias -> Popen for headless workers we spawned
+        self._workers     = {}   # type: Dict[str, subprocess.Popen]
+        # Default alias; None means auto-select if exactly one connection exists.
+        self._default     = None # type: Optional[str]
+
+    # --- Connection lifecycle (external bridge ports) ---
+
+    def connect(self, port: int,
+                alias: Optional[str] = None) -> dict:
+        """Connect to an existing bridge (live GUI or already-running worker).
+
+        port  -- TCP port to connect to.
+        alias -- Name to register under. Auto-derived from the connected
+                 capture's filename stem if omitted.
+
+        Returns the instance_info dict for the connection, with the
+        chosen alias added.
+        """
+        client = RenderDocClient()
+        client.connect(port)
+
+        info = self._fetch_info(client)
+        client._info = info
+
+        if alias is None:
+            alias = self._unique_alias(_alias_from_info(info, port))
+
+        self._replace_alias(alias, client)
+        result = dict(info or {})
+        result["alias"] = alias
+        result["port"]  = port
         return result
 
-    # --- Headless worker management ---
+    def disconnect(self, alias: Optional[str] = None) -> str:
+        """Close the named connection without killing any associated worker.
 
-    def spawn_headless_worker(self, capture_path: str) -> dict:
-        """Spawn a headless worker for a .rdc file.
+        If alias is omitted, disconnects the sole active connection;
+        raises if more than one is active.
 
-        Picks a free port in the agentic range and a free port in the
-        renderdoccmd remote-server range, launches the worker as a
-        subprocess, and waits for the bridge port to come up. Tracks
-        the Popen handle so close_headless_worker() can terminate it.
+        Returns the alias that was disconnected.
+        """
+        target = self._only_alias(alias)
+        client = self._connections.pop(target, None)
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
 
-        Returns the bound port, the captured PID, and the metadata
-        from a probe of the new instance.
+        if self._default == target:
+            self._default = None
+        return target
 
-        Raises RuntimeError on any failure; the subprocess is reaped if
-        it was started.
+    # --- Worker lifecycle (spawn + close) ---
+
+    def open(self, capture_path: str,
+             alias: Optional[str] = None) -> dict:
+        """Spawn a headless worker for a .rdc file and connect to it.
+
+        capture_path -- Absolute path to the .rdc capture file.
+        alias        -- Name to register under. Auto-derived from the
+                        capture filename stem if omitted.
+
+        Returns the worker metadata (alias, port, remote_port, pid, info).
+        Raises RuntimeError on any spawn failure; the subprocess is
+        reaped if it was started.
         """
         capture = Path(capture_path)
         if not capture.exists():
-            raise RuntimeError(f"capture not found: {capture}")
+            raise RuntimeError("capture not found: {}".format(capture))
 
-        # Reserve ports — pick free, pass exact-port range to worker.
-        bridge_port = self._first_free_port(_PORT_RANGE, exclude=set(self._spawned))
+        used_ports = {c.connected_port for c in self._connections.values()
+                      if c.connected_port is not None}
+        bridge_port = _first_free_port(_PORT_RANGE, exclude=used_ports)
         if bridge_port is None:
             raise RuntimeError(
-                f"no free port in agentic range "
-                f"{_PORT_RANGE.start}-{_PORT_RANGE.stop - 1}"
+                "no free port in agentic range "
+                "{}-{}".format(_PORT_RANGE.start, _PORT_RANGE.stop - 1)
             )
 
         # On Windows the standard RenderDoc distribution does not ship
         # ``renderdoc.pyd`` for external Python — the SWIG bindings are
-        # compiled into ``qrenderdoc.exe``. Run headless logic inside
-        # qrenderdoc's embedded Python via ``--script``; it exits via
-        # ``os._exit(0)`` before qrenderdoc ever opens its main UI, and
-        # uses in-process ``rd.OpenCaptureFile`` rather than
-        # ``renderdoccmd remoteserver``. No remote port needed.
+        # compiled into ``qrenderdoc.exe``. The Windows branch of
+        # ``_launch_worker`` runs headless logic inside qrenderdoc's
+        # embedded Python via ``--script`` and uses in-process
+        # ``rd.OpenCaptureFile`` rather than ``renderdoccmd
+        # remoteserver``. No remote port needed there.
         windows_embedded = sys.platform == "win32"
 
         if windows_embedded:
             remote_port = None
-            qrd_path = _find_qrenderdoc()
-            if qrd_path is None:
-                raise RuntimeError(
-                    "could not locate qrenderdoc.exe (looked on PATH and "
-                    "%ProgramFiles%\\RenderDoc); install RenderDoc system-wide"
-                )
-            embedded_script = (
-                Path(__file__).resolve().parent.parent / "extension" / "embedded_headless.py"
-            )
-            cmd = [qrd_path, "--script", str(embedded_script)]
         else:
-            remote_port = self._first_free_port(_REMOTE_PORT_RANGE)
+            remote_port = _first_free_port(_REMOTE_PORT_RANGE)
             if remote_port is None:
                 raise RuntimeError(
-                    f"no free port in remote range "
-                    f"{_REMOTE_PORT_RANGE.start}-{_REMOTE_PORT_RANGE.stop - 1}"
+                    "no free port in remote range "
+                    "{}-{}".format(_REMOTE_PORT_RANGE.start, _REMOTE_PORT_RANGE.stop - 1)
                 )
-            cmd = [
-                sys.executable,
-                "-u",
-                "-m", "extension.headless",
-                str(capture.resolve()),
-                "--port-min",        str(bridge_port),
-                "--port-max",        str(bridge_port),
-                "--remote-port-min", str(remote_port),
-                "--remote-port-max", str(remote_port),
-            ]
 
-        env = os.environ.copy()
-        # Make sure the extension/ package is importable.
-        src_dir = Path(__file__).resolve().parent.parent
-        existing_pp = env.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = (
-            f"{src_dir}{os.pathsep}{existing_pp}" if existing_pp else str(src_dir)
+        proc, stderr_drain, stderr_buffer = _launch_worker(
+            capture.resolve(), bridge_port, remote_port,
         )
-        # Disable Vulkan implicit layers in the worker. The system has
-        # the RenderDoc capture layer registered globally
-        # (/etc/vulkan/implicit_layer.d/renderdoc_capture.json), and the
-        # Vulkan loader will auto-inject it into any process that
-        # initialises Vulkan. That conflicts with the replay role of the
-        # same library — librenderdoc.so loaded twice with different
-        # roles asserts and eventually drops the proxy socket with
-        # EBADF. We set both the all-layers disable and the specific
-        # layer disable for belt-and-suspenders coverage across loader
-        # versions.
-        env["VK_LOADER_LAYERS_DISABLE"]                = "*"
-        env["DISABLE_VK_LAYER_RENDERDOC_Capture_1"]    = "1"
 
-        if windows_embedded:
-            # qrenderdoc does not populate sys.argv inside --script, so
-            # the embedded script reads its config from env vars instead.
-            # PKG_PARENT is the directory the script prepends to sys.path
-            # so it can ``from extension.context import ...`` etc.
-            # (relying on __file__ would be flaky — qrenderdoc doesn't
-            # always populate it under --script).
-            env["AGENTIC_EMBEDDED_CAPTURE"]    = str(capture.resolve())
-            env["AGENTIC_EMBEDDED_PORT_MIN"]   = str(bridge_port)
-            env["AGENTIC_EMBEDDED_PORT_MAX"]   = str(bridge_port)
-            env["AGENTIC_EMBEDDED_PKG_PARENT"] = str(src_dir)
-            # Prevent qrenderdoc's AlwaysLoad_Extensions auto-load from
-            # binding a competing bridge on the same port. With Windows'
-            # SO_REUSEADDR semantics both bridges would coexist as
-            # listeners and incoming connections would routinely hit the
-            # GuiHandlerContext-backed one instead of ours. The
-            # extension's register() checks this var and no-ops.
-            env["AGENTIC_DISABLE_AUTOLOAD"]    = "1"
-
-        popen_kwargs = {
-            "stdin"  : subprocess.DEVNULL,
-            "stdout" : subprocess.DEVNULL,
-            "stderr" : subprocess.PIPE,
-            "env"    : env,
-        }
-        if sys.platform.startswith("linux"):
-            popen_kwargs["preexec_fn"] = _die_with_parent
-
-        proc = subprocess.Popen(cmd, **popen_kwargs)
-        # Why stdin=DEVNULL: when this MCP server is launched via stdio
-        # (Claude Code's default), our own stdin is the JSON-RPC socket.
-        # If the worker inherits that fd, renderdoc/renderdoccmd may read
-        # bytes off it during startup and corrupt our protocol stream
-        # — manifests as the proxy socket dropping with EBADF a few
-        # seconds after OpenCapture.
-
-        # Capture early stderr in a buffer for diagnostic on bind failure,
-        # then once the worker is healthy keep draining (to DEVNULL) so the
-        # pipe can never fill and block the worker on a stderr write.
-        stderr_buffer: list[bytes] = []
-        stderr_drain  = threading.Event()
-
-        def _drain_stderr() -> None:
-            stream = proc.stderr
-            if stream is None:
-                return
-            try:
-                while True:
-                    chunk = stream.read(4096)
-                    if not chunk:
-                        return
-                    if not stderr_drain.is_set():
-                        stderr_buffer.append(chunk)
-                    # else: discard
-            except Exception:
-                return
-
-        threading.Thread(
-            target = _drain_stderr,
-            name   = f"agentic-stderr-{bridge_port}",
-            daemon = True,
-        ).start()
-
-        # Poll for the bridge port to come up.
-        info = self._wait_for_worker(proc, bridge_port, timeout=_WORKER_BIND_WAIT)
+        info = _wait_for_bridge(proc, bridge_port, timeout=_WORKER_BIND_WAIT)
         if info is None:
-            self._reap_proc(proc)
+            _reap_proc(proc)
             err_bytes = b"".join(stderr_buffer)
             err_text  = err_bytes.decode("utf-8", errors="replace").strip()
 
@@ -711,52 +711,60 @@ class RenderDocClient:
                 diag  = err_text or "<empty>"
                 label = "stderr"
             raise RuntimeError(
-                f"headless worker did not bind on {bridge_port} within "
-                f"{_WORKER_BIND_WAIT:.0f}s; {label}: {diag}"
+                "headless worker did not bind on {} within {:.0f}s; "
+                "{}: {}".format(bridge_port, _WORKER_BIND_WAIT, label, diag)
             )
 
-        # Worker is healthy. Stop buffering — drain thread keeps reading
-        # but discards.
+        # Healthy — stop buffering stderr but keep the drain thread running.
         stderr_drain.set()
         stderr_buffer.clear()
 
-        self._spawned[bridge_port] = proc
+        if alias is None:
+            alias = self._unique_alias(_alias_from_info(info, bridge_port))
+
+        client = RenderDocClient()
+        client.connect(bridge_port, worker_proc=proc)
+        client._info = info
+
+        self._workers[alias] = proc
+        self._replace_alias(alias, client)
 
         return {
+            "alias"       : alias,
             "port"        : bridge_port,
             "remote_port" : remote_port,
             "pid"         : proc.pid,
             "info"        : info,
         }
 
-    def close_headless_worker(self, port: int, force: bool = False) -> dict:
-        """Stop a headless worker. Returns a status dict.
+    def close(self, alias: Optional[str] = None,
+              force: bool = False) -> dict:
+        """Stop a headless worker and drop its connection.
 
-        First tries a graceful shutdown via the bridge's ``shutdown``
-        command. Then SIGTERMs the subprocess; escalates to SIGKILL on
-        ``force=True`` or after a grace period.
+        Graceful path: ``shutdown`` command, SIGTERM, SIGKILL. With
+        force=True jumps straight to SIGKILL.
 
-        Returns ``{"closed": True, ...}`` on success; ``{"closed": False,
-        "reason": ...}`` if the port isn't a worker we own.
+        Returns a status dict. Raises KeyError if the alias has no
+        associated worker (i.e. it was an external connect()).
         """
-        proc = self._spawned.get(port)
+        target = self._only_alias(alias)
+        proc = self._workers.get(target)
         if proc is None:
             return {
                 "closed" : False,
+                "alias"  : target,
                 "reason" : (
-                    f"port {port} is not a worker spawned by this server; "
-                    "use Instance(action='disconnect') for live RenderDoc UIs"
+                    "alias {!r} has no worker (external connection); "
+                    "use Instance(action='disconnect') instead".format(target)
                 ),
             }
 
-        # Step 1: ask the bridge to shut down via the protocol if it's
-        # still responsive. Best-effort; a wedged worker may not reply.
-        # Then give it a chance to exit on its own — the worker has to
-        # tear down its renderdoccmd remoteserver child too, which can
-        # take a moment.
+        port = self._connections[target].connected_port
+
         if not force:
             try:
-                self._send_shutdown_to(port)
+                if port is not None:
+                    _send_shutdown_to(port)
             except Exception:
                 pass
             try:
@@ -764,7 +772,6 @@ class RenderDocClient:
             except subprocess.TimeoutExpired:
                 pass
 
-        # Step 2: SIGTERM and wait briefly.
         if proc.poll() is None and not force:
             try:
                 proc.terminate()
@@ -775,7 +782,6 @@ class RenderDocClient:
             except subprocess.TimeoutExpired:
                 pass
 
-        # Step 3: SIGKILL on force or if still alive.
         if proc.poll() is None:
             try:
                 proc.kill()
@@ -788,146 +794,317 @@ class RenderDocClient:
 
         rc = proc.returncode
 
-        # If we're connected to this worker, drop the connection.
-        if self._port == port:
-            self.disconnect()
-
-        del self._spawned[port]
+        # Drop the connection and worker entry.
+        client = self._connections.pop(target, None)
+        if client is not None:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+        self._workers.pop(target, None)
+        if self._default == target:
+            self._default = None
 
         return {
-            "closed"      : True,
-            "port"        : port,
-            "exit_code"   : rc,
-            "force"       : force,
+            "closed"    : True,
+            "alias"     : target,
+            "port"      : port,
+            "exit_code" : rc,
+            "force"     : force,
         }
 
-    def reap_dead_workers(self) -> list[int]:
-        """Clean up any tracked workers whose process exited unexpectedly.
+    def reap_dead(self) -> List[str]:
+        """Clean up workers whose process exited unexpectedly.
 
-        Returns a list of ports whose workers had died. Useful for
+        Returns a list of aliases whose workers had died. Useful for
         liveness checks before reporting instance lists.
         """
-        dead: list[int] = []
-        for port, proc in list(self._spawned.items()):
+        dead = []
+        for alias, proc in list(self._workers.items()):
             if proc.poll() is not None:
-                dead.append(port)
-                if self._port == port:
-                    self.disconnect()
-                del self._spawned[port]
+                dead.append(alias)
+                client = self._connections.pop(alias, None)
+                if client is not None:
+                    try:
+                        client.disconnect()
+                    except Exception:
+                        pass
+                self._workers.pop(alias, None)
+                if self._default == alias:
+                    self._default = None
         return dead
 
-    @property
-    def spawned_ports(self) -> list[int]:
-        """Ports of headless workers we currently track."""
-        return list(self._spawned.keys())
+    # --- Routing ---
 
-    # --- Internal: worker spawn helpers ---
+    def set_default(self, alias: str) -> None:
+        """Set the alias used when send() is called without one."""
+        if alias not in self._connections:
+            raise KeyError("no connection named {!r}".format(alias))
+        self._default = alias
 
-    def _first_free_port(self, port_range: range, exclude: set[int] | None = None) -> int | None:
-        """Return the first locally-bindable port in range, skipping exclude."""
-        excl = exclude or set()
-        for port in port_range:
-            if port in excl:
-                continue
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            try:
-                s.bind(("127.0.0.1", port))
-            except OSError:
-                continue
-            finally:
-                s.close()
-            return port
-        return None
+    def send(self, cmd: str, params: dict,
+             alias: Optional[str] = None,
+             read_timeout: Optional[float] = None) -> dict:
+        """Send a command to a named (or default) connection."""
+        client = self._resolve(alias)
+        return client.send(cmd, params, read_timeout=read_timeout)
 
-    def _wait_for_worker(self, proc: subprocess.Popen, port: int, timeout: float) -> dict | None:
-        """Block until the worker binds on port and answers instance_info.
+    def ensure_connected(self) -> dict:
+        """If no connections exist, discover and connect to the first port.
 
-        Returns the instance_info data dict, or None on timeout / proc death.
+        Backwards-compatible with the no-config workflow upstream had:
+        a tool called on a fresh pool will find any running RenderDoc
+        instance and connect to it as the default alias.
+
+        Returns a dict with port + alias + info for the (newly or
+        previously) default connection. Raises ConnectionError if no
+        running instance is found.
         """
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                return None
-            info = self._probe_port(port, enrich=True)
-            if info is not None and info.get("capture_loaded"):
-                return info
-            time.sleep(0.25)
-        return None
+        if self._connections:
+            alias = self.default_alias
+            client = self._connections[alias]
+            return {
+                "alias" : alias,
+                "port"  : client.connected_port,
+                "info"  : client._info,
+            }
 
-    def _send_shutdown_to(self, port: int) -> None:
-        """Send a one-shot shutdown command to a worker on a specific port."""
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(_CONNECT_TIMEOUT)
-        s.connect(("127.0.0.1", port))
-        s.settimeout(_WRITE_TIMEOUT)
-        s.sendall(b'{"cmd":"shutdown","params":{}}\n')
-        # Best-effort response read; ignore content.
-        s.settimeout(2.0)
-        try:
-            s.recv(1024)
-        except OSError:
-            pass
-        finally:
-            s.close()
+        for port in _PORT_RANGE:
+            if _probe_port(port) is not None:
+                result = self.connect(port)
+                return {
+                    "alias" : result["alias"],
+                    "port"  : port,
+                    "info"  : result,
+                }
+        raise ConnectionError("no RenderDoc instances found")
 
-    def _reap_proc(self, proc: subprocess.Popen) -> None:
-        """Politely terminate a Popen we don't intend to track."""
-        if proc.poll() is not None:
-            return
-        try:
-            proc.terminate()
-        except OSError:
-            pass
-        try:
-            proc.wait(timeout=_WORKER_GRACE_SECS)
-        except subprocess.TimeoutExpired:
+    # --- Discovery ---
+
+    def discover_instances(self, enrich: bool = False) -> List[dict]:
+        """Probe the port range and return all running bridges.
+
+        Annotates each entry with its alias if it is already in the pool,
+        and with a ``headless`` flag if the alias was spawned by us.
+        """
+        port_to_alias = {
+            c.connected_port: a
+            for a, c in self._connections.items()
+            if c.connected_port is not None
+        }
+
+        results = []
+        for port in _PORT_RANGE:
+            info = _probe_port(port, enrich=enrich)
+            if info is None:
+                continue
+            alias = port_to_alias.get(port)
+            if alias is not None:
+                info["alias"]    = alias
+                info["headless"] = alias in self._workers
+            results.append(info)
+        return results
+
+    # --- Status ---
+
+    @property
+    def aliases(self) -> List[str]:
+        """All active connection aliases."""
+        return list(self._connections.keys())
+
+    @property
+    def default_alias(self) -> Optional[str]:
+        """Default alias for send(); auto-selects if exactly one connection."""
+        if self._default is None and len(self._connections) == 1:
+            return next(iter(self._connections))
+        return self._default
+
+    def connection_info(self) -> List[dict]:
+        """Summary of all active connections: alias, port, info, headless."""
+        result = []
+        for alias, client in self._connections.items():
+            entry = {
+                "alias"    : alias,
+                "port"     : client.connected_port,
+                "headless" : alias in self._workers,
+            }
+            if client._info:
+                entry["info"] = client._info
+            result.append(entry)
+        return result
+
+    # --- Internal helpers ---
+
+    def _resolve(self, alias: Optional[str]) -> RenderDocClient:
+        """Return the client for the given alias, falling back to the default."""
+        if not self._connections:
+            raise ConnectionError(
+                "no RenderDoc connections; "
+                "use Instance(action='connect') or Instance(action='open')"
+            )
+
+        target = alias or self.default_alias
+        if target is None:
+            names = ", ".join(repr(a) for a in self._connections)
+            raise ConnectionError(
+                "multiple instances connected ({}); "
+                "specify alias= or use Instance(action='set_default')"
+                .format(names)
+            )
+
+        if target not in self._connections:
+            raise KeyError(
+                "no connection named {!r}; available: {}"
+                .format(target, list(self._connections))
+            )
+
+        return self._connections[target]
+
+    def _only_alias(self, alias: Optional[str]) -> str:
+        """Resolve a sole-active alias when none was passed explicitly."""
+        if alias is not None:
+            return alias
+        if len(self._connections) == 1:
+            return next(iter(self._connections))
+        if not self._connections:
+            raise KeyError("no active connections")
+        raise KeyError(
+            "multiple connections active; specify alias= to choose one"
+        )
+
+    def _unique_alias(self, candidate: str) -> str:
+        """Append a numeric suffix if needed to avoid clobbering."""
+        if candidate not in self._connections:
+            return candidate
+        i = 2
+        while "{}_{}".format(candidate, i) in self._connections:
+            i += 1
+        return "{}_{}".format(candidate, i)
+
+    def _replace_alias(self, alias: str, client: RenderDocClient) -> None:
+        """Register client under alias, evicting any prior occupant."""
+        existing = self._connections.get(alias)
+        if existing is not None:
             try:
-                proc.kill()
-            except OSError:
+                existing.disconnect()
+            except Exception:
                 pass
-            try:
-                proc.wait(timeout=_WORKER_GRACE_SECS)
-            except subprocess.TimeoutExpired:
-                pass
+        self._connections[alias] = client
+        if self._default is None:
+            self._default = alias
 
     @staticmethod
-    def _enrich_instance(sock: socket.socket, instance: dict) -> dict:
-        """Query instance_info over an already-connected probe socket.
-
-        Sends the instance_info command and merges the response data
-        into the instance dict. Uses a short timeout so a slow instance
-        does not block discovery. On any failure, returns the instance
-        dict unchanged.
-
-        sock     -- Connected probe socket.
-        instance -- Base instance dict (must contain "port").
-        """
+    def _fetch_info(client: RenderDocClient) -> Optional[dict]:
+        """Best-effort instance_info fetch right after connect."""
         try:
-            request = json.dumps({"cmd": "instance_info", "params": {}}) + "\n"
+            resp = client.send("instance_info", {})
+        except (ConnectionError, OSError):
+            return None
+        if resp.get("ok") and isinstance(resp.get("data"), dict):
+            return resp["data"]
+        return None
 
-            sock.settimeout(_ENRICH_TIMEOUT)
-            sock.sendall(request.encode("utf-8"))
 
-            # Read until we get a complete line.
-            buf = ""
-            while "\n" not in buf:
-                chunk = sock.recv(65536)
+# ---------------------------------------------------------------------------
+# Worker subprocess launch — module-level so the pool can stay focused
+# on lifecycle bookkeeping rather than process plumbing.
+# ---------------------------------------------------------------------------
+
+def _launch_worker(capture_path: Path, bridge_port: int, remote_port: Optional[int]):
+    """Spawn the headless worker subprocess.
+
+    Returns (Popen, stderr_drain_event, stderr_buffer_list). The pool is
+    responsible for ``_wait_for_bridge`` afterwards and for setting the
+    drain event once the worker is healthy.
+
+    On Windows ``remote_port`` is ignored — the worker runs inside
+    ``qrenderdoc.exe --script`` and uses in-process
+    ``rd.OpenCaptureFile`` rather than ``renderdoccmd remoteserver``.
+    """
+    src_dir = Path(__file__).resolve().parent.parent
+    env = os.environ.copy()
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = (
+        "{}{}{}".format(src_dir, os.pathsep, existing_pp)
+        if existing_pp else str(src_dir)
+    )
+
+    if sys.platform == "win32":
+        qrd_path = _find_qrenderdoc()
+        if qrd_path is None:
+            raise RuntimeError(
+                "could not locate qrenderdoc.exe (looked on PATH and "
+                "%ProgramFiles%\\RenderDoc); install RenderDoc system-wide"
+            )
+        embedded_script = src_dir / "extension" / "embedded_headless.py"
+        cmd = [qrd_path, "--script", str(embedded_script)]
+        # qrenderdoc does not populate sys.argv inside --script, so the
+        # embedded script reads config from env vars. PKG_PARENT is the
+        # directory the script prepends to sys.path so it can ``from
+        # extension.context import ...`` etc.
+        env["AGENTIC_EMBEDDED_CAPTURE"]    = str(capture_path)
+        env["AGENTIC_EMBEDDED_PORT_MIN"]   = str(bridge_port)
+        env["AGENTIC_EMBEDDED_PORT_MAX"]   = str(bridge_port)
+        env["AGENTIC_EMBEDDED_PKG_PARENT"] = str(src_dir)
+        # Prevent qrenderdoc's AlwaysLoad_Extensions auto-load from
+        # binding a competing bridge on the same port. With Windows'
+        # SO_REUSEADDR semantics both bridges would coexist as listeners
+        # and incoming connections would routinely hit the
+        # GuiHandlerContext-backed one instead of ours.
+        env["AGENTIC_DISABLE_AUTOLOAD"]    = "1"
+    else:
+        cmd = [
+            sys.executable,
+            "-u",
+            "-m", "extension.headless",
+            str(capture_path),
+            "--port-min",        str(bridge_port),
+            "--port-max",        str(bridge_port),
+            "--remote-port-min", str(remote_port),
+            "--remote-port-max", str(remote_port),
+        ]
+        # Disable Vulkan implicit layers in the worker. The system has the
+        # RenderDoc capture layer registered globally and the Vulkan loader
+        # will auto-inject it into any process that initialises Vulkan. That
+        # conflicts with the replay role of the same library — librenderdoc.so
+        # loaded twice with different roles asserts and eventually drops the
+        # proxy socket with EBADF. Set both the all-layers disable and the
+        # specific layer disable for belt-and-suspenders coverage.
+        env["VK_LOADER_LAYERS_DISABLE"]             = "*"
+        env["DISABLE_VK_LAYER_RENDERDOC_Capture_1"] = "1"
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin      = subprocess.DEVNULL,
+        stdout     = subprocess.DEVNULL,
+        stderr     = subprocess.PIPE,
+        env        = env,
+        preexec_fn = _die_with_parent if sys.platform.startswith("linux") else None,
+    )
+
+    # Drain stderr into a buffer until the worker is healthy, then
+    # discard. Avoids the pipe filling and blocking the worker.
+    stderr_buffer = []
+    stderr_drain  = threading.Event()
+
+    def _drain() -> None:
+        stream = proc.stderr
+        if stream is None:
+            return
+        try:
+            while True:
+                chunk = stream.read(4096)
                 if not chunk:
-                    return instance
-                buf += chunk.decode("utf-8")
+                    return
+                if not stderr_drain.is_set():
+                    stderr_buffer.append(chunk)
+        except Exception:
+            return
 
-            line = buf.split("\n", 1)[0]
-            resp = json.loads(line)
+    threading.Thread(
+        target = _drain,
+        name   = "agentic-stderr-{}".format(bridge_port),
+        daemon = True,
+    ).start()
 
-            if resp.get("ok") and isinstance(resp.get("data"), dict):
-                # Merge response data into the instance, preserving the
-                # port from our probe (authoritative) over any port in
-                # the response payload.
-                merged = {**resp["data"], **instance}
-                return merged
-        except (ConnectionError, BrokenPipeError, OSError,
-                json.JSONDecodeError, UnicodeDecodeError):
-            pass
-
-        return instance
+    return proc, stderr_drain, stderr_buffer
