@@ -384,6 +384,17 @@ def eval(code: str, instance: str | None = None,
             "name": str, "flags": [str]}. Useful for frame structure
             exploration. Works both inside and outside ctx.replay().
 
+        find_marker(name, regex=False, case_sensitive=False,
+                    markers_only=False, parent=None)
+            Search the action tree for markers (PushMarker scopes) or
+            draw names containing the given substring or regex. Returns
+            a list of {"eventId", "name", "path", "is_marker",
+            "customName"} where "path" is the "/"-joined ancestor marker
+            scopes ("RenderImageSpaceEffect/BloomBlur/..."). Pass
+            ``parent=eventId`` to scope the search to a subtree, or
+            ``markers_only=True`` to skip leaf draws. Skip the manual
+            recursive walk.
+
         describe_draw(eventId=eid)
             (keyword-only — `describe_draw(eid)` raises.)
             One-shot comprehensive summary of a draw call. Returns event_id,

@@ -815,6 +815,119 @@ def make_describe_draw(ctx: Any) -> Callable[..., dict]:
     return describe_draw
 
 
+def make_find_marker(ctx: Any) -> Callable[..., List[dict]]:
+    """Create a find_marker function bound to the given HandlerContext.
+
+    Skyrim and most engines emit a deep PushMarker tree
+    (RenderImageSpaceEffect → BloomBlur → …). Walking it manually every
+    session to locate "the shadow pass" is repetitive boilerplate. This
+    utility wraps the recursive walk with name matching plus an optional
+    parent scope.
+    """
+    def find_marker(name             : str,
+                    regex            : bool          = False,
+                    case_sensitive   : bool          = False,
+                    markers_only     : bool          = False,
+                    parent           : Optional[int] = None,
+                    controller       : Any           = None) -> List[dict]:
+        """Search the action tree for actions whose name matches.
+
+        Matches against both ``customName`` (the PushMarker label) and
+        ``GetName()`` (the formatted display name, e.g.
+        ``vkCmdDrawIndexed(36, 1, 0, 0, 0)`` or
+        ``RenderImageSpaceEffect``), so the same call finds either a
+        marker scope or a draw call with the name in its display.
+
+        Safe to call both inside and outside a ctx.replay() callback.
+
+        name           -- Substring (default) or regex pattern to match.
+        regex          -- If True, treat ``name`` as a regular expression.
+        case_sensitive -- Default False (case-insensitive substring or
+                          re.IGNORECASE).
+        markers_only   -- If True, restrict matches to PushMarker /
+                          SetMarker actions (skip leaf draws/dispatches).
+        parent         -- Event ID of a marker whose subtree to limit
+                          the search to. None = search the whole frame.
+        controller     -- Optional ReplayController if already inside
+                          ctx.replay(); auto-dispatched otherwise.
+
+        Returns a list of dicts:
+            eventId    -- Action event ID (use with SetFrameEvent or goto_event)
+            name       -- GetName() formatted display name
+            path       -- "/"-joined ancestor marker scopes
+            is_marker  -- True if the matched action is a PushMarker/SetMarker
+            customName -- Raw customName field (may be empty for non-markers)
+        """
+        import re as _re
+
+        marker_flags = (rd.ActionFlags.PushMarker | rd.ActionFlags.SetMarker)
+
+        pattern = None  # type: Optional[Any]
+        needle  = ""
+        if regex:
+            pattern = _re.compile(name, 0 if case_sensitive else _re.IGNORECASE)
+        else:
+            needle = name if case_sensitive else name.lower()
+
+        def _matches(text: str) -> bool:
+            if not text:
+                return False
+            if pattern is not None:
+                return pattern.search(text) is not None
+            hay = text if case_sensitive else text.lower()
+            return needle in hay
+
+        def _collect(ctrl: Any) -> List[dict]:
+            results = []   # type: List[dict]
+            sf = ctx.structured_file
+
+            def _recurse(actions: list, path_segments: List[str]) -> None:
+                for action in actions:
+                    is_marker = bool(action.flags & marker_flags)
+                    custom    = getattr(action, "customName", "") or ""
+                    display   = action.GetName(sf)
+
+                    # Extend the path on entering a named marker scope.
+                    if is_marker and custom:
+                        new_path = path_segments + [custom]
+                    else:
+                        new_path = path_segments
+
+                    skip = markers_only and not is_marker
+                    if not skip and (_matches(custom) or _matches(display)):
+                        results.append({
+                            "eventId"    : action.eventId,
+                            "name"       : display,
+                            "path"       : "/".join(new_path),
+                            "is_marker"  : is_marker,
+                            "customName" : custom,
+                        })
+
+                    _recurse(action.children, new_path)
+
+            if parent is not None:
+                root_actions  = ctrl.GetRootActions()
+                parent_action = _find_action(root_actions, parent)
+                if parent_action is None:
+                    return []
+                seed = [parent_action.customName] if getattr(
+                    parent_action, "customName", "") else []
+                _recurse(parent_action.children, seed)
+            else:
+                _recurse(ctrl.GetRootActions(), [])
+
+            return results
+
+        if controller is not None:
+            return _collect(controller)
+        active = ctx._replay_controller
+        if active is not None:
+            return _collect(active)
+        return ctx.replay(_collect)
+
+    return find_marker
+
+
 def _find_action(actions: list, eventId: int) -> Any:
     """Recursively search the action tree for an action by event ID.
 
@@ -1024,6 +1137,7 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "get_resource_name"    : make_get_resource_name(ctx),
         "get_draw_calls"       : make_get_draw_calls(ctx),
         "get_all_actions"      : make_get_all_actions(ctx),
+        "find_marker"          : make_find_marker(ctx),
         "describe_draw"        : make_describe_draw(ctx),
         "goto_event"           : make_goto_event(ctx),
         "view_texture"         : make_view_texture(ctx),
