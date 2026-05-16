@@ -854,11 +854,12 @@ def _decode_texture(raw: bytes, width: int, height: int, fmt: dict, black_point:
 
 @mcp.tool(name="Instance")
 def instance(
-    action : str,
-    port   : int | None = None,
-    file   : str | None = None,
-    force  : bool       = False,
-    alias  : str | None = None,
+    action    : str,
+    port      : int | None = None,
+    file      : str | None = None,
+    force     : bool       = False,
+    alias     : str | None = None,
+    directory : str | None = None,
 ) -> dict:
     """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
@@ -886,18 +887,44 @@ def instance(
                                  ``force=True`` to SIGKILL immediately.
              - ``set_default`` : Pin a default alias so calls without
                                  ``instance=`` route to it.
+             - ``captures``    : Ask a *GUI* instance to list .rdc files
+                                 from RenderDoc's configured capture
+                                 directory (DefaultCaptureSaveDirectory,
+                                 etc.). The Qt-only "Captures" panel that
+                                 the live UI shows when attached to a
+                                 target has no Python-API surface; this
+                                 is the closest scriptable equivalent.
+                                 Returns its Config()-discovered dirs
+                                 plus RecentCaptureFiles for context.
+             - ``load_capture``: Load ``file`` (.rdc) in a GUI instance.
+                                 Dispatched on the Qt UI thread — never
+                                 call ctx.ctx.LoadCapture from Eval (it
+                                 deadlocks the replay thread). Pass
+                                 ``force=True`` to close any currently
+                                 loaded capture first.
+             - ``close_capture``: Close the currently loaded capture in
+                                 a GUI instance (Qt-UI-thread safe).
 
-    port    : Port for connect.
-    file    : .rdc path for open.
-    force   : For close: skip graceful shutdown and SIGKILL immediately.
-    alias   : Pool alias. For connect/open: name to register under
-              (auto-derived from capture filename if omitted). For
-              disconnect/close/set_default: which alias to target. If
-              omitted with exactly one connection active, that one is used.
+    Headless workers refuse load_capture/close_capture/captures — they
+    are pinned to the file they were spawned for; use ``open``/``close``
+    for their lifecycle and ``discover`` for server-side FS scanning.
 
-    Capture discovery directories default to ``/tmp/RenderDoc`` (Linux)
-    or ``%TEMP%\\RenderDoc`` (Windows). Add extra paths via the
-    ``AGENTIC_RENDERDOC_CAPTURE_DIRS`` env var (os.pathsep-separated).
+    port      : Port for connect.
+    file      : .rdc path for open / load_capture.
+    directory : Optional dir override for captures (defaults to the
+                GUI's DefaultCaptureSaveDirectory / TemporaryCaptureDirectory).
+    force     : close: skip graceful shutdown and SIGKILL immediately.
+                load_capture: close any currently loaded capture first.
+    alias     : Pool alias. For connect/open: name to register under
+                (auto-derived from capture filename if omitted). For
+                disconnect/close/set_default/captures/load_capture/
+                close_capture: which alias to target. If omitted with
+                exactly one connection active, that one is used.
+
+    Capture discovery directories for ``discover`` default to
+    ``/tmp/RenderDoc`` (Linux) or ``%TEMP%\\RenderDoc`` (Windows). Add
+    extra paths via the ``AGENTIC_RENDERDOC_CAPTURE_DIRS`` env var
+    (os.pathsep-separated).
     """
     if action == "list":
         _pool.reap_dead()
@@ -946,6 +973,34 @@ def instance(
         except KeyError as e:
             return {"ok": False, "error": str(e)}
         return {"ok": True, "default": alias}
+
+    if action == "captures":
+        params: dict = {}
+        if directory is not None:
+            params["directory"] = directory
+        try:
+            return _pool.send("capture_list", params, alias=alias)
+        except (ConnectionError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
+
+    if action == "load_capture":
+        if not file:
+            return {"ok": False, "error": "file is required for load_capture"}
+        try:
+            return _pool.send(
+                "capture_load",
+                {"path": file, "replace": force},
+                alias        = alias,
+                read_timeout = 120.0,
+            )
+        except (ConnectionError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
+
+    if action == "close_capture":
+        try:
+            return _pool.send("capture_close", {}, alias=alias)
+        except (ConnectionError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
 
     return {"ok": False, "error": f"unknown action: {action}"}
 

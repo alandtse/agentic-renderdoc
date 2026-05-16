@@ -237,6 +237,244 @@ def handle_get_texture(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     return ctx.replay(callback)
 
 
+# --- capture_load / capture_close / capture_list ---
+#
+# These manage the .rdc currently loaded in a *GUI* instance (the
+# qrenderdoc-hosted bridge). Headless workers own the capture for
+# their entire lifetime — opening or closing it is what spawning /
+# closing the worker is for, so the handlers refuse to run there.
+
+@handler(
+    "capture_load",
+    description="Open an .rdc capture file in this GUI instance.",
+    schema={
+        "properties": {
+            "path"    : {"type": "string",  "description": "Absolute path to a .rdc capture file."},
+            "replace" : {"type": "boolean", "description": "If True and a capture is already loaded, close it first. Default False."},
+        },
+        "required": ["path"],
+    },
+)
+def handle_capture_load(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Load a capture file via the UI thread.
+
+    LoadCapture is async on RenderDoc's side: it queues a load and the
+    OnCaptureLoaded callback fires when ready. This handler returns as
+    soon as the UI thread has accepted the load request. Poll
+    instance_info to confirm completion.
+    """
+    import os
+
+    if getattr(ctx, "headless", False):
+        return {
+            "ok"    : False,
+            "error" : (
+                "capture_load is GUI-only; headless workers are pinned to "
+                "the capture they were spawned for. Use "
+                "Instance(action='open', file=...) to create a new worker."
+            ),
+        }
+
+    path = params.get("path")
+    if not path:
+        return {"ok": False, "error": "path is required"}
+
+    if not os.path.isfile(path):
+        return {"ok": False, "error": "file not found: {}".format(path)}
+
+    replace        = bool(params.get("replace", False))
+    already_loaded = ctx._capture_loaded
+
+    if already_loaded and not replace:
+        return {
+            "ok"           : False,
+            "error"        : "a capture is already loaded; pass replace=True to close it first",
+            "current_path" : ctx._capture_path,
+        }
+
+    if ctx._replay_controller is not None:
+        return {
+            "ok"    : False,
+            "error" : "a replay is currently in flight on this instance; retry after it finishes",
+        }
+
+    try:
+        import renderdoc as rd
+        def do_load():
+            if already_loaded:
+                ctx.ctx.CloseCapture()
+            ctx.ctx.LoadCapture(path, rd.ReplayOptions(), path, False, True)
+        ctx.invoke_ui(do_load)
+    except Exception as e:
+        return {"ok": False, "error": "LoadCapture failed: {}".format(e)}
+
+    return {
+        "ok"   : True,
+        "data" : {
+            "path"     : path,
+            "replaced" : already_loaded,
+            "note"     : "load is asynchronous; poll instance_info to confirm completion",
+        },
+    }
+
+
+@handler(
+    "capture_close",
+    description="Close the currently loaded capture in this GUI instance.",
+    schema={},
+)
+def handle_capture_close(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Close the active capture via the UI thread.
+
+    Refuses to run while a replay is in flight — closing the capture
+    out from under an active replay was the observed CTD in
+    multi-session use.
+    """
+    if getattr(ctx, "headless", False):
+        return {
+            "ok"    : False,
+            "error" : (
+                "capture_close is GUI-only; close a headless worker via "
+                "Instance(action='close', alias=...)."
+            ),
+        }
+
+    if not ctx._capture_loaded:
+        return {"ok": False, "error": "no capture loaded"}
+
+    if ctx._replay_controller is not None:
+        return {
+            "ok"    : False,
+            "error" : "a replay is currently in flight on this instance; retry after it finishes",
+        }
+
+    closed_path = ctx._capture_path
+
+    try:
+        ctx.invoke_ui(lambda: ctx.ctx.CloseCapture())
+    except Exception as e:
+        return {"ok": False, "error": "CloseCapture failed: {}".format(e)}
+
+    return {"ok": True, "data": {"closed_path": closed_path}}
+
+
+@handler(
+    "capture_list",
+    description="List .rdc files in the GUI instance's default capture directory.",
+    schema={
+        "properties": {
+            "directory" : {"type": "string", "description": "Directory to scan. Defaults to RenderDoc's DefaultCaptureSaveDirectory (falling back to the directory of the last opened capture)."},
+        },
+    },
+)
+def handle_capture_list(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
+    """List .rdc files in the GUI's resolved capture directory.
+
+    Resolution order: explicit ``directory`` param, then
+    Config().DefaultCaptureSaveDirectory, then
+    Config().TemporaryCaptureDirectory, then the directory of
+    Config().LastCaptureFilePath. Also returns
+    Config().RecentCaptureFiles for convenience.
+
+    For server-side discovery without any connected instance, see
+    Instance(action='discover') which scans /tmp/RenderDoc (Linux) or
+    %TEMP%\\RenderDoc (Windows) instead of asking a RenderDoc UI.
+    """
+    import os
+
+    if getattr(ctx, "headless", False):
+        return {
+            "ok"    : False,
+            "error" : (
+                "capture_list queries the GUI's PersistantConfig which "
+                "has no analogue in a headless worker; use "
+                "Instance(action='discover') for server-side FS scanning."
+            ),
+        }
+
+    directory = params.get("directory")
+    config    = None
+    try:
+        config = ctx.ctx.Config()
+    except Exception:
+        pass
+
+    default_dir = ""
+    temp_dir    = ""
+    last_path   = ""
+    recents     = []  # type: List[str]
+    if config is not None:
+        try:
+            default_dir = str(getattr(config, "DefaultCaptureSaveDirectory", "") or "")
+            temp_dir    = str(getattr(config, "TemporaryCaptureDirectory",    "") or "")
+            last_path   = str(getattr(config, "LastCaptureFilePath",          "") or "")
+            recents_raw = getattr(config, "RecentCaptureFiles", []) or []
+            recents     = [str(p) for p in recents_raw]
+        except Exception:
+            pass
+
+    if not directory:
+        for candidate in (default_dir, temp_dir,
+                          os.path.dirname(last_path) if last_path else ""):
+            if candidate and os.path.isdir(candidate):
+                directory = candidate
+                break
+
+    if not directory:
+        return {
+            "ok"    : False,
+            "error" : (
+                "no capture directory available — RenderDoc has no "
+                "DefaultCaptureSaveDirectory set and no recent capture. "
+                "Pass directory= explicitly."
+            ),
+            "config" : {
+                "default_capture_save_directory" : default_dir,
+                "temporary_capture_directory"    : temp_dir,
+                "last_capture_file_path"         : last_path,
+                "recent_capture_files"           : recents,
+            },
+        }
+
+    if not os.path.isdir(directory):
+        return {"ok": False, "error": "not a directory: {}".format(directory)}
+
+    files = []
+    try:
+        for name in sorted(os.listdir(directory)):
+            if not name.lower().endswith(".rdc"):
+                continue
+            full = os.path.join(directory, name)
+            try:
+                st = os.stat(full)
+            except OSError:
+                continue
+            files.append({
+                "name"  : name,
+                "path"  : full,
+                "size"  : st.st_size,
+                "mtime" : st.st_mtime,
+            })
+    except OSError as e:
+        return {"ok": False, "error": "listing failed: {}".format(e)}
+
+    files.sort(key=lambda f: f["mtime"], reverse=True)
+
+    return {
+        "ok"   : True,
+        "data" : {
+            "directory" : directory,
+            "files"     : files,
+            "config"    : {
+                "default_capture_save_directory" : default_dir,
+                "temporary_capture_directory"    : temp_dir,
+                "last_capture_file_path"         : last_path,
+                "recent_capture_files"           : recents,
+            },
+        },
+    }
+
+
 # --- reload (dev only) ---
 
 @handler(
