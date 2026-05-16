@@ -358,12 +358,58 @@ def handle_capture_close(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     return {"ok": True, "data": {"closed_path": closed_path}}
 
 
+def _read_thumbnail(path, max_size):
+    # type: (str, int) -> Optional[Dict[str, Any]]
+    """Open a .rdc file and return its embedded thumbnail as base64 PNG.
+
+    Uses rd.OpenCaptureFile().OpenFile()+.GetThumbnail() — these only
+    parse file headers and never touch the live replay session, so they
+    are safe to call from the bridge handler thread.
+
+    Returns None on any failure (file missing, no embedded thumb,
+    unsupported format).
+    """
+    import base64
+    try:
+        import renderdoc as rd
+    except ImportError:
+        return None
+
+    cf = None
+    try:
+        cf = rd.OpenCaptureFile()
+        result = cf.OpenFile(path, "rdc", None)
+        if result is not None and hasattr(result, "code"):
+            if rd.ResultCode is not None and result.code != rd.ResultCode.Succeeded:
+                return None
+        thumb = cf.GetThumbnail(rd.FileType.PNG, max(16, int(max_size)))
+        if thumb is None or not thumb.data:
+            return None
+        return {
+            "data_b64" : base64.b64encode(bytes(thumb.data)).decode("ascii"),
+            "width"    : int(thumb.width),
+            "height"   : int(thumb.height),
+            "format"   : "png",
+        }
+    except Exception:
+        return None
+    finally:
+        if cf is not None:
+            try:
+                cf.Shutdown()
+            except Exception:
+                pass
+
+
 @handler(
     "capture_list",
     description="List .rdc files in the GUI instance's default capture directory.",
     schema={
         "properties": {
-            "directory" : {"type": "string", "description": "Directory to scan. Defaults to RenderDoc's DefaultCaptureSaveDirectory (falling back to the directory of the last opened capture)."},
+            "directory"          : {"type": "string",  "description": "Directory to scan. Defaults to RenderDoc's DefaultCaptureSaveDirectory (falling back to the directory of the last opened capture)."},
+            "thumbnails"         : {"type": "boolean", "description": "Include embedded PNG thumbnails for each capture (base64-encoded). Default False."},
+            "thumbnail_max_size" : {"type": "integer", "description": "Max width/height in pixels for thumbnails (default 256)."},
+            "limit"              : {"type": "integer", "description": "When thumbnails=True, cap how many files are read (newest first). Default 12, 0 = no limit."},
         },
     },
 )
@@ -459,6 +505,15 @@ def handle_capture_list(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         return {"ok": False, "error": "listing failed: {}".format(e)}
 
     files.sort(key=lambda f: f["mtime"], reverse=True)
+
+    if params.get("thumbnails"):
+        max_size = int(params.get("thumbnail_max_size", 256))
+        limit    = int(params.get("limit", 12))
+        targets  = files if limit <= 0 else files[:limit]
+        for entry in targets:
+            thumb = _read_thumbnail(entry["path"], max_size)
+            if thumb is not None:
+                entry["thumbnail"] = thumb
 
     return {
         "ok"   : True,

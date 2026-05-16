@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing  import Any
 
 from PIL import Image as PILImage
 
@@ -854,13 +855,16 @@ def _decode_texture(raw: bytes, width: int, height: int, fmt: dict, black_point:
 
 @mcp.tool(name="Instance")
 def instance(
-    action    : str,
-    port      : int | None = None,
-    file      : str | None = None,
-    force     : bool       = False,
-    alias     : str | None = None,
-    directory : str | None = None,
-) -> dict:
+    action             : str,
+    port               : int | None = None,
+    file               : str | None = None,
+    force              : bool       = False,
+    alias              : str | None = None,
+    directory          : str | None = None,
+    thumbnails         : bool       = False,
+    thumbnail_max_size : int        = 256,
+    limit              : int        = 12,
+) -> Any:
     """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
     Connections are tracked by alias in a pool, so multiple instances can
@@ -896,6 +900,10 @@ def instance(
                                  is the closest scriptable equivalent.
                                  Returns its Config()-discovered dirs
                                  plus RecentCaptureFiles for context.
+                                 Pass ``thumbnails=True`` to also stream
+                                 the embedded PNG thumbnails as inline
+                                 MCP image blocks (one per .rdc, newest
+                                 first; capped by ``limit``, default 12).
              - ``load_capture``: Load ``file`` (.rdc) in a GUI instance.
                                  Dispatched on the Qt UI thread — never
                                  call ctx.ctx.LoadCapture from Eval (it
@@ -978,10 +986,17 @@ def instance(
         params: dict = {}
         if directory is not None:
             params["directory"] = directory
+        if thumbnails:
+            params["thumbnails"]         = True
+            params["thumbnail_max_size"] = thumbnail_max_size
+            params["limit"]              = limit
         try:
-            return _pool.send("capture_list", params, alias=alias)
+            resp = _pool.send("capture_list", params, alias=alias)
         except (ConnectionError, KeyError) as e:
             return {"ok": False, "error": str(e)}
+        if not thumbnails or not resp.get("ok"):
+            return resp
+        return _captures_with_thumbnails(resp)
 
     if action == "load_capture":
         if not file:
@@ -1003,6 +1018,35 @@ def instance(
             return {"ok": False, "error": str(e)}
 
     return {"ok": False, "error": f"unknown action: {action}"}
+
+
+def _captures_with_thumbnails(resp: dict) -> list:
+    """Convert a capture_list response with embedded thumbnails into MCP
+    content blocks: one JSON metadata block plus an inline PNG per file.
+    """
+    data    = resp.get("data", {})
+    files   = data.get("files", [])
+    summary = {
+        "directory" : data.get("directory"),
+        "config"    : data.get("config", {}),
+        "files"     : [
+            {k: v for k, v in f.items() if k != "thumbnail"}
+            for f in files
+        ],
+    }
+
+    blocks: list = [TextContent(type="text", text=json.dumps(summary, indent=2))]
+    for f in files:
+        thumb = f.get("thumbnail")
+        if not thumb:
+            continue
+        try:
+            png_bytes = base64.b64decode(thumb["data_b64"])
+        except (KeyError, ValueError):
+            continue
+        blocks.append(TextContent(type="text", text=f["name"]))
+        blocks.append(MCPImage(data=png_bytes, format="png").to_image_content())
+    return blocks
 
 
 # --- task ---
