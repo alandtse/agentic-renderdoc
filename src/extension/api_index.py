@@ -124,6 +124,16 @@ def build_index() -> List[dict]:
 
     entries = []
     _walk_module(rd, "renderdoc", entries, visited=set())
+
+    # Append hand-curated concept entries. These answer "how do I X?"
+    # questions that pure introspection of the renderdoc module
+    # cannot — they index utilities, MCP tools, and workflow patterns.
+    try:
+        from .concepts import CONCEPTS
+        entries.extend(CONCEPTS)
+    except ImportError:
+        pass
+
     return entries
 
 
