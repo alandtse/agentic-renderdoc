@@ -1105,6 +1105,10 @@ def instance(
     thumbnails         : bool       = False,
     thumbnail_max_size : int        = 256,
     limit              : int        = 12,
+    instance_a         : str | None = None,
+    instance_b         : str | None = None,
+    eid_start          : int | None = None,
+    eid_end            : int | None = None,
 ) -> Any:
     """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
@@ -1153,6 +1157,18 @@ def instance(
                                  loaded capture first.
              - ``close_capture``: Close the currently loaded capture in
                                  a GUI instance (Qt-UI-thread safe).
+             - ``find_first_divergence``:
+                                 Bisect events between two pool aliases
+                                 (e.g. baseline vs broken) and return
+                                 the first event where pipeline state
+                                 diverges — different shaders bound,
+                                 different render target list, different
+                                 depth target. Requires ``instance_a``
+                                 and ``instance_b``; ``eid_start``/
+                                 ``eid_end`` optionally clamp the
+                                 search range. Long-running for large
+                                 captures — combine with async via the
+                                 Task tool.
 
     Headless workers refuse load_capture/close_capture/captures — they
     are pinned to the file they were spawned for; use ``open``/``close``
@@ -1258,7 +1274,165 @@ def instance(
         except (ConnectionError, KeyError) as e:
             return {"ok": False, "error": str(e)}
 
+    if action == "find_first_divergence":
+        if not instance_a or not instance_b:
+            return {
+                "ok"    : False,
+                "error" : "find_first_divergence requires instance_a= and instance_b=",
+            }
+        try:
+            return _find_first_divergence(
+                instance_a, instance_b, eid_start, eid_end,
+            )
+        except (ConnectionError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
+
     return {"ok": False, "error": f"unknown action: {action}"}
+
+
+def _find_first_divergence(instance_a: str,
+                           instance_b: str,
+                           eid_start : int | None,
+                           eid_end   : int | None) -> dict:
+    """Bisect events between two pool aliases, return first divergence.
+
+    Strategy:
+      1. Pull the leaf draw-call list from instance_a via get_draw_calls
+         (one ctx.replay() trip, cheap). That's our event index.
+      2. Clamp the index to [eid_start, eid_end] if either was passed.
+      3. Check the endpoints first: if a and b already match at the
+         last clamped event, divergence (if any) is past the range; if
+         they differ at the first event, divergence is at or before it.
+      4. Otherwise binary-search: at each candidate mid event, call
+         describe_draws([mid]) on both instances, compare. If they
+         match → divergence is right of mid → lo = mid+1. Else → hi = mid.
+
+    Per-step cost is two describe_draws calls, each costing one
+    SetFrameEvent (full GPU replay). For a 10K-event frame this is
+    ~14 steps → 28 replays total, vs. a naive linear walk's 20K.
+
+    Returns:
+        {
+          first_divergent_event : int | None,
+          name                  : str | None,
+          comparisons_made      : int,
+          examined              : { a: {...}, b: {...} },  # at the diverging event
+          range                 : [low, high]
+        }
+    """
+    draws_resp = _pool.send(
+        "eval",
+        {"code": "get_draw_calls()"},
+        alias=instance_a,
+    )
+    if not draws_resp.get("ok"):
+        return {"ok": False, "error": "could not list draws from {!r}: {}".format(
+            instance_a, draws_resp.get("error"))}
+
+    draws = draws_resp.get("data") or []
+    event_ids = [d["eventId"] for d in draws if isinstance(d, dict) and "eventId" in d]
+    if not event_ids:
+        return {"ok": False, "error": "no draw calls found on {!r}".format(instance_a)}
+
+    # Clamp to [eid_start, eid_end].
+    if eid_start is not None:
+        event_ids = [e for e in event_ids if e >= eid_start]
+    if eid_end is not None:
+        event_ids = [e for e in event_ids if e <= eid_end]
+    if not event_ids:
+        return {"ok": False, "error": "no draw events in the requested range"}
+
+    # Quick description helpers.
+    def _describe_at(alias: str, eid: int) -> dict | None:
+        resp = _pool.send(
+            "eval",
+            {"code": "describe_draws([{}])".format(eid)},
+            alias=alias,
+            read_timeout=120.0,
+        )
+        if not resp.get("ok"):
+            return None
+        data = resp.get("data") or []
+        return data[0] if data else None
+
+    def _equal(d_a: dict, d_b: dict) -> bool:
+        keys = ("shaders", "render_targets", "depth_target")
+        return all(d_a.get(k) == d_b.get(k) for k in keys) \
+               and d_a.get("name") == d_b.get("name")
+
+    comparisons = 0
+
+    # Endpoint check: last event first (most common pass — captures match all the way).
+    last = event_ids[-1]
+    a_last = _describe_at(instance_a, last)
+    b_last = _describe_at(instance_b, last)
+    comparisons += 2
+    if a_last is None or b_last is None:
+        return {
+            "ok"    : False,
+            "error" : "describe at last event ({}) failed for one instance".format(last),
+        }
+    if _equal(a_last, b_last):
+        return {
+            "ok"                    : True,
+            "first_divergent_event" : None,
+            "name"                  : None,
+            "comparisons_made"      : comparisons,
+            "range"                 : [event_ids[0], event_ids[-1]],
+            "note"                  : "no divergence detected across {} events".format(len(event_ids)),
+        }
+
+    # Endpoint check: first event. If already diverged here, that's our answer.
+    first = event_ids[0]
+    a_first = _describe_at(instance_a, first)
+    b_first = _describe_at(instance_b, first)
+    comparisons += 2
+    if a_first is None or b_first is None:
+        return {
+            "ok"    : False,
+            "error" : "describe at first event ({}) failed for one instance".format(first),
+        }
+    if not _equal(a_first, b_first):
+        return {
+            "ok"                    : True,
+            "first_divergent_event" : first,
+            "name"                  : a_first.get("name"),
+            "comparisons_made"      : comparisons,
+            "range"                 : [event_ids[0], event_ids[-1]],
+            "examined"              : {"a": a_first, "b": b_first},
+        }
+
+    # Binary search: invariant — match at lo, differ at hi.
+    lo = 0
+    hi = len(event_ids) - 1
+    while lo + 1 < hi:
+        mid_idx = (lo + hi) // 2
+        mid_eid = event_ids[mid_idx]
+        a_mid = _describe_at(instance_a, mid_eid)
+        b_mid = _describe_at(instance_b, mid_eid)
+        comparisons += 2
+        if a_mid is None or b_mid is None:
+            return {
+                "ok"    : False,
+                "error" : "describe at event {} failed for one instance".format(mid_eid),
+            }
+        if _equal(a_mid, b_mid):
+            lo = mid_idx
+        else:
+            hi = mid_idx
+
+    diverging_eid = event_ids[hi]
+    return {
+        "ok"                    : True,
+        "first_divergent_event" : diverging_eid,
+        "name"                  : a_last.get("name") if hi == len(event_ids) - 1 else None,
+        "comparisons_made"      : comparisons,
+        "range"                 : [event_ids[0], event_ids[-1]],
+        "examined"              : {
+            "a" : _describe_at(instance_a, diverging_eid),
+            "b" : _describe_at(instance_b, diverging_eid),
+        },
+    }
 
 
 def _captures_with_thumbnails(resp: dict) -> list:
