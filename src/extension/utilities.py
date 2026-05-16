@@ -476,6 +476,167 @@ def summarize_data(values: Any) -> dict:
     }
 
 
+def make_summarize_texture(ctx: Any) -> Callable[..., dict]:
+    """Create a summarize_texture function bound to the given HandlerContext.
+
+    Equivalent of summarize_data for texture pixels. The first
+    diagnostic when a render target looks "wrong" — is it all black?
+    Blown out? Full of NaNs? — should be a one-line judgment, not
+    save_texture + visual inspection.
+    """
+    def summarize_texture(resource_id : Any,
+                          event_id    : Optional[int] = None,
+                          mip         : int           = 0,
+                          slice_index : int           = 0,
+                          sample      : int           = 0,
+                          channel     : Optional[int] = None,
+                          controller  : Any           = None) -> dict:
+        """Per-channel min/max/mean/NaN/Inf over a texture's pixels.
+
+        Supports the same formats as Get-Texture's decoder (8-bit
+        UNORM/SRGB, 16/32-bit Float). Block-compressed formats and
+        depth/stencil produce a structured error.
+
+        Safe to call both inside and outside a ctx.replay() callback.
+
+        resource_id -- int, str (decimal), or rd.ResourceId.
+        event_id    -- Event ID to SetFrameEvent before reading.
+                       Required for render targets.
+        mip         -- Mip level (default 0).
+        slice_index -- Array slice or cube face (default 0).
+        sample      -- Multisample index (default 0).
+        channel     -- If set, summarize only that channel index
+                       (0=R, 1=G, 2=B, 3=A). Default: all channels.
+        controller  -- Optional ReplayController if already inside
+                       ctx.replay(); auto-dispatched otherwise.
+
+        Returns:
+            {
+              "resource"   : "ResourceId(…)",
+              "format"     : "R16G16B16A16_FLOAT",
+              "mip_width"  : 1920,
+              "mip_height" : 1080,
+              "channels"   : ["r", "g", "b", "a"],
+              "stats"      : {
+                  "r" : {min, max, mean, count, nan_count, inf_count},
+                  "g" : { … },
+                  …
+              }
+            }
+        """
+        import struct as _struct
+        from . import serialize
+
+        # Coerce resource_id to compare against TextureDescription.resourceId.
+        if hasattr(resource_id, "__int__"):
+            try:
+                target_id = int(resource_id)
+            except Exception:
+                target_id = None
+        elif isinstance(resource_id, str):
+            try:
+                target_id = int(resource_id)
+            except ValueError:
+                target_id = None
+        else:
+            target_id = None
+
+        if target_id is None:
+            return {"error": "resource_id must be an int, decimal str, or rd.ResourceId"}
+
+        def _do(ctrl: Any) -> dict:
+            if event_id is not None:
+                ctrl.SetFrameEvent(int(event_id), True)
+
+            tex = None
+            for t in ctrl.GetTextures():
+                if int(t.resourceId) == target_id:
+                    tex = t
+                    break
+            if tex is None:
+                return {"error": "no texture with resource id {}".format(target_id)}
+
+            mip_w = max(1, tex.width  >> mip)
+            mip_h = max(1, tex.height >> mip)
+
+            try:
+                raw = ctrl.GetTextureData(tex.resourceId,
+                                          rd.Subresource(mip, slice_index, sample))
+            except Exception as e:
+                return {"error": "GetTextureData failed: {}".format(e)}
+            if not raw:
+                return {"error": "GetTextureData returned empty"}
+
+            fmt = tex.format
+            comp_type  = getattr(fmt, "compType", None)
+            comp_count = getattr(fmt, "compCount", 0)
+            comp_bytes = getattr(fmt, "compByteWidth", 0)
+            try:
+                fmt_name = fmt.Name()
+            except Exception:
+                fmt_name = str(fmt)
+
+            # Resolve component-type name (SWIG enum-like).
+            ct_name = comp_type.name if hasattr(comp_type, "name") else str(comp_type)
+
+            channel_names = ["r", "g", "b", "a"][:comp_count] or ["r"]
+
+            # Unpack into per-channel float lists.
+            pixel_count = mip_w * mip_h
+
+            if comp_bytes == 1 and ct_name in ("UNorm", "UNormSRGB"):
+                # 8-bit UNORM: normalize 0..255 -> 0..1
+                vals = list(raw[: pixel_count * comp_count])
+                per_chan = [[vals[i + c] / 255.0 for i in range(0, len(vals), comp_count)]
+                            for c in range(comp_count)]
+            elif ct_name == "Float" and comp_bytes in (2, 4):
+                code  = "e" if comp_bytes == 2 else "f"
+                total = pixel_count * comp_count
+                expected = total * comp_bytes
+                if len(raw) < expected:
+                    return {"error": "short read: got {} bytes, expected {}".format(
+                        len(raw), expected)}
+                floats = _struct.unpack("<{}{}".format(total, code), raw[:expected])
+                per_chan = [list(floats[c::comp_count]) for c in range(comp_count)]
+            else:
+                return {
+                    "error" : "unsupported format for summary: {} ({}, {}c, {}b)".format(
+                        fmt_name, ct_name, comp_count, comp_bytes
+                    ),
+                    "hint"  : "block-compressed and depth/stencil aren't decoded; "
+                              "use Get-Texture for visual inspection",
+                }
+
+            # Optional single-channel filter.
+            if channel is not None:
+                if not (0 <= channel < comp_count):
+                    return {"error": "channel {} out of range for {} channels".format(
+                        channel, comp_count)}
+                per_chan = [per_chan[channel]]
+                channel_names = [channel_names[channel]]
+
+            stats = {name: summarize_data(vals)
+                     for name, vals in zip(channel_names, per_chan)}
+
+            return {
+                "resource"   : serialize.resource_id(tex.resourceId),
+                "format"     : fmt_name,
+                "mip_width"  : mip_w,
+                "mip_height" : mip_h,
+                "channels"   : channel_names,
+                "stats"      : stats,
+            }
+
+        if controller is not None:
+            return _do(controller)
+        active = ctx._replay_controller
+        if active is not None:
+            return _do(active)
+        return ctx.replay(_do)
+
+    return summarize_texture
+
+
 # --- Action Flags ---
 
 def action_flags(flags: Any) -> List[str]:
@@ -1370,6 +1531,7 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "auto_decode_cb"       : make_auto_decode_cb(ctx),
         "interpret_buffer"     : interpret_buffer,
         "summarize_data"       : summarize_data,
+        "summarize_texture"    : make_summarize_texture(ctx),
         "action_flags"         : action_flags,
         "decode_push_constants" : decode_push_constants,
     }

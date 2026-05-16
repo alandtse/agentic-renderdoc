@@ -371,6 +371,16 @@ def eval(code: str, instance: str | None = None,
             Compute min, max, mean, count, nan_count, inf_count over
             a flat list of numbers. Quick buffer/texture inspection.
 
+        summarize_texture(resource_id, event_id=None, mip=0, slice_index=0,
+                          channel=None)
+            Per-channel min/max/mean/NaN/Inf over texture pixels. First
+            diagnostic when a render target "looks wrong" — black? blown
+            out? NaN'd? Returns {resource, format, mip_width, mip_height,
+            channels, stats} where stats maps each channel name to a
+            summarize_data result. Supports 8-bit UNORM/SRGB and 16/32-bit
+            float formats; block-compressed and depth/stencil return a
+            structured error.
+
         action_flags(flags)
             Decode an ActionDescription.flags int into a list of flag name strings.
 
