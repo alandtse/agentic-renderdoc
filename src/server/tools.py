@@ -352,6 +352,16 @@ def eval(code: str, instance: str | None = None,
             diff showing what changed (shaders, render targets, blend,
             depth, bound resources, etc.).
 
+        auto_decode_cb(stage, slot=0, eventId=None)
+            Read + decode a constant buffer at a stage/slot in one call.
+            Handles Vulkan VK_WHOLE_SIZE, walks GetShaderReflection for
+            the variable layout, returns {stage, slot, name, resource,
+            byte_offset, byte_size, decoded}. ``stage`` is either an
+            rd.ShaderStage enum or a string alias ("ps"/"pixel",
+            "cs"/"compute", "vs"/"vertex", etc.). Skip the manual
+            SetFrameEvent → GetConstantBlocks → GetBufferData →
+            cbuffer_variables chain.
+
         interpret_buffer(data, fmt)
             Decode raw bytes from GetBufferData into typed values.
             fmt is a ResourceFormat object or a dict with keys:

@@ -561,6 +561,181 @@ def decode_push_constants(controller: Any, stage: Any) -> dict:
     return result
 
 
+_STAGE_NAMES = {
+    "vs"       : "Vertex",
+    "vertex"   : "Vertex",
+    "hs"       : "Hull",
+    "hull"     : "Hull",
+    "ds"       : "Domain",
+    "domain"   : "Domain",
+    "gs"       : "Geometry",
+    "geometry" : "Geometry",
+    "ps"       : "Pixel",
+    "pixel"    : "Pixel",
+    "fragment" : "Pixel",
+    "fs"       : "Pixel",
+    "cs"       : "Compute",
+    "compute"  : "Compute",
+}
+
+
+def _resolve_stage(stage: Any) -> Any:
+    """Map a string alias to an rd.ShaderStage enum; pass enums through."""
+    if isinstance(stage, str):
+        canonical = _STAGE_NAMES.get(stage.lower())
+        if canonical is None:
+            raise ValueError(
+                "unknown stage {!r}; expected one of {}".format(
+                    stage, sorted(set(_STAGE_NAMES.values()))
+                )
+            )
+        return getattr(rd.ShaderStage, canonical)
+    return stage
+
+
+def make_auto_decode_cb(ctx: Any) -> Callable[..., dict]:
+    """Create an auto_decode_cb function bound to the given HandlerContext.
+
+    Reading a constant buffer in agentic-renderdoc today is six lines
+    of boilerplate (SetFrameEvent → GetConstantBlocks → byteOffset/Size
+    → GetBufferData → GetShaderReflection → cbuffer_variables) every
+    time. This utility wraps the chain.
+    """
+    def auto_decode_cb(stage          : Any,
+                       slot           : int           = 0,
+                       eventId        : Optional[int] = None,
+                       controller     : Any           = None) -> dict:
+        """Read + decode a constant buffer at a stage/slot in one call.
+
+        Looks up the constant block at ``slot`` on the given stage,
+        reads its bound buffer range (handling Vulkan's VK_WHOLE_SIZE
+        sentinel correctly), and decodes the bytes against the shader
+        reflection's variables list.
+
+        Safe to call both inside and outside a ctx.replay() callback.
+
+        stage      -- rd.ShaderStage enum or a string alias: "vs", "ps",
+                      "cs", "vertex", "pixel", "fragment", "compute", …
+        slot       -- Index into GetConstantBlocks(stage). Default 0.
+        eventId    -- Event ID to SetFrameEvent to before reading. If
+                      None, uses whatever event the cursor was last on.
+        controller -- Optional ReplayController if already inside
+                      ctx.replay(); auto-dispatched otherwise.
+
+        Returns:
+            {
+              "stage"      : "Pixel",
+              "slot"       : 0,
+              "name"       : "PerFrame",      # cbuffer name if available
+              "resource"   : "ResourceId(…)",
+              "byte_offset": 0,
+              "byte_size"  : 256,
+              "decoded"    : [ {name, type, value}, … ]
+            }
+        On any failure, returns a dict with an "error" key.
+        """
+        from . import serialize
+
+        try:
+            stage_enum = _resolve_stage(stage)
+        except ValueError as e:
+            return {"error": str(e)}
+        stage_name = stage_enum.name if hasattr(stage_enum, "name") else str(stage_enum)
+
+        # u64::MAX — Vulkan's VK_WHOLE_SIZE encoded into byteSize.
+        VK_WHOLE_SIZE = 0xFFFFFFFFFFFFFFFF
+
+        def _do(ctrl: Any) -> dict:
+            if eventId is not None:
+                ctrl.SetFrameEvent(int(eventId), True)
+
+            state = ctrl.GetPipelineState()
+
+            try:
+                blocks = state.GetConstantBlocks(stage_enum)
+            except Exception as e:
+                return {"error": "GetConstantBlocks failed: {}".format(e)}
+
+            if slot < 0 or slot >= len(blocks):
+                return {
+                    "error" : "slot {} out of range; stage {} has {} constant block(s)".format(
+                        slot, stage_name, len(blocks)
+                    ),
+                }
+
+            ud   = blocks[slot]
+            desc = ud.descriptor
+            resource = desc.resource
+
+            if int(resource) == 0:
+                return {
+                    "stage"   : stage_name,
+                    "slot"    : slot,
+                    "name"    : None,
+                    "decoded" : None,
+                    "note"    : "no buffer bound at this slot",
+                }
+
+            byte_offset = int(desc.byteOffset)
+            byte_size   = int(desc.byteSize)
+
+            # VK_WHOLE_SIZE means "to end of buffer" — look up the actual length.
+            if byte_size == VK_WHOLE_SIZE:
+                buf_len = None
+                try:
+                    for buf in ctrl.GetBuffers():
+                        if int(buf.resourceId) == int(resource):
+                            buf_len = int(buf.length)
+                            break
+                except Exception:
+                    pass
+                if buf_len is None:
+                    return {
+                        "error" : "buffer length unknown (VK_WHOLE_SIZE) and "
+                                  "GetBuffers did not return the resource",
+                    }
+                byte_size = max(0, buf_len - byte_offset)
+
+            data = ctrl.GetBufferData(resource, byte_offset, byte_size)
+            if not data:
+                return {
+                    "stage"   : stage_name,
+                    "slot"    : slot,
+                    "decoded" : None,
+                    "note"    : "GetBufferData returned empty",
+                }
+
+            cb_name = None
+            decoded = None
+            try:
+                refl = state.GetShaderReflection(stage_enum)
+                if refl and len(refl.constantBlocks) > slot:
+                    cb     = refl.constantBlocks[slot]
+                    cb_name = cb.name
+                    decoded = serialize.cbuffer_variables(cb.variables, data)
+            except Exception:
+                pass
+
+            return {
+                "stage"       : stage_name,
+                "slot"        : slot,
+                "name"        : cb_name,
+                "resource"    : serialize.resource_id(resource),
+                "byte_offset" : byte_offset,
+                "byte_size"   : byte_size,
+                "decoded"     : decoded,
+            }
+
+        if controller is not None:
+            return _do(controller)
+        active = ctx._replay_controller
+        if active is not None:
+            return _do(active)
+        return ctx.replay(_do)
+
+    return auto_decode_cb
+
+
 # --- Action Tree ---
 
 def make_get_draw_calls(ctx: Any) -> Callable[..., List[dict]]:
@@ -1192,6 +1367,7 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "view_texture"         : make_view_texture(ctx),
         "save_texture"         : make_save_texture(ctx),
         "highlight_drawcall"   : make_highlight_drawcall(ctx),
+        "auto_decode_cb"       : make_auto_decode_cb(ctx),
         "interpret_buffer"     : interpret_buffer,
         "summarize_data"       : summarize_data,
         "action_flags"         : action_flags,
