@@ -289,11 +289,34 @@ def eval(code: str, instance: str | None = None,
 
     Modules:
         rd           -- the renderdoc module (import renderdoc as rd)
-        qrd          -- the qrenderdoc module (UI types)
+        qrd          -- the qrenderdoc module (UI types; GUI only)
         ctx          -- HandlerContext:
                         ctx.replay(callback) for replay access
                         ctx.structured_file  for ActionDescription.GetName()
+                        ctx.ctx              the live qrenderdoc.CaptureContext
+                                             (GUI only — see UI-LEVEL CONTEXT)
+                        ctx.headless         True inside a headless worker
         serialize    -- type serialization (see below)
+
+    UI-LEVEL CONTEXT (ctx.ctx, GUI only)
+    ------------------------------------
+    On a GUI instance, ``ctx.ctx`` is the live qrenderdoc.CaptureContext —
+    the same object the RenderDoc UI uses. Useful read-only handles:
+
+        ctx.ctx.Config()                         -- PersistantConfig
+            .DefaultCaptureSaveDirectory         -- str, default save dir
+            .TemporaryCaptureDirectory           -- str
+            .LastCaptureFilePath                 -- str, last opened capture
+            .RecentCaptureFiles                  -- list[str] (often stale)
+        ctx.ctx.GetCaptureFilename()             -- str, currently loaded
+        ctx.ctx.GetCaptureFile()                 -- ICaptureFile
+        ctx.ctx.GetStructuredFile()              -- SDFile (also ctx.structured_file)
+        ctx.ctx.APIProps().pipelineType          -- GraphicsAPI enum
+
+    DO NOT call ctx.ctx.LoadCapture() or ctx.ctx.CloseCapture() from Eval.
+    Both are intercepted and refuse to run — see PERFORMANCE AND STABILITY.
+    For browsing captures on disk, prefer Instance(action="captures",
+    thumbnails=True) which bundles the same info with inline previews.
 
     Functions:
         inspect(obj)
@@ -362,6 +385,7 @@ def eval(code: str, instance: str | None = None,
             exploration. Works both inside and outside ctx.replay().
 
         describe_draw(eventId=eid)
+            (keyword-only — `describe_draw(eid)` raises.)
             One-shot comprehensive summary of a draw call. Returns event_id,
             name, shaders, render_targets, depth_target, draw_params,
             vertex_buffers, index_buffer, and push_constants in a single
@@ -519,8 +543,19 @@ def eval(code: str, instance: str | None = None,
       sum of all replays with no interleaving. If any replay hangs
       (driver timeout, device lost), the entire application freezes
       permanently.
-    - NEVER call LoadCapture from eval. It re-enters the replay
-      lifecycle while the replay thread is active. Guaranteed deadlock.
+    - NEVER call LoadCapture or CloseCapture from eval (raw
+      ctx.ctx.LoadCapture / ctx.ctx.CloseCapture). Both are intercepted
+      and will raise. Reasons:
+        LoadCapture  -- re-enters the replay lifecycle while the replay
+                        thread is active. Guaranteed deadlock.
+        CloseCapture -- CaptureContext is Qt-UI-thread-only. Eval runs
+                        on the bridge handler thread; off-thread Qt
+                        calls crash RenderDoc (observed CTD in
+                        multi-session use). Worse during a concurrent
+                        replay on another connection.
+      Use Instance(action="load_capture", file=...) and
+      Instance(action="close_capture") — they dispatch through invoke_ui
+      and refuse to run while a replay is in flight.
     - NEVER issue rapid-fire ctx.replay() calls in a tight loop.
       Each call blocks the replay thread. Allow the system to breathe.
 
