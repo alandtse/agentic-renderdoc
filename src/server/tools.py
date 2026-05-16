@@ -17,9 +17,9 @@ from mcp.server.fastmcp.utilities.types import Image as MCPImage
 from mcp.types import TextContent
 
 from server.app import mcp
-from server.client import RenderDocClient
+from server.client import ConnectionPool
 
-_client = RenderDocClient()
+_pool = ConnectionPool()
 
 
 # Default capture-dump locations scanned by Instance(action='discover').
@@ -38,7 +38,7 @@ _CAPTURE_NAME_RE = re.compile(
 # --- eval ---
 
 @mcp.tool(name="Eval")
-def eval(code: str) -> dict:
+def eval(code: str, instance: str | None = None) -> dict:
     """Execute Python code in a live RenderDoc replay session.
 
     This is your primary interface for all GPU capture inspection, analysis,
@@ -484,13 +484,18 @@ def eval(code: str) -> dict:
     - get_draw_calls(), get_all_actions(), and describe_draw() are
       designed to be safe single-replay-per-call utilities.
     """
-    return _client.send("eval", {"code": code})
+    if not _pool.aliases:
+        try:
+            _pool.ensure_connected()
+        except ConnectionError as e:
+            return {"ok": False, "error": str(e)}
+    return _pool.send("eval", {"code": code}, alias=instance)
 
 
 # --- search_api ---
 
 @mcp.tool(name="Search-API")
-def search_api(query: str) -> dict:
+def search_api(query: str, instance: str | None = None) -> dict:
     """Search the RenderDoc Python API reference by name or concept.
 
     Use this tool for discovery: finding what API exists for a task,
@@ -508,7 +513,12 @@ def search_api(query: str) -> dict:
         doc:       Full RST-formatted docstring with param/type/return info
         signature: Method signature string, if applicable (e.g., "(eventId, force)")
     """
-    return _client.send("api_index", {"query": query})
+    if not _pool.aliases:
+        try:
+            _pool.ensure_connected()
+        except ConnectionError as e:
+            return {"ok": False, "error": str(e)}
+    return _pool.send("api_index", {"query": query}, alias=instance)
 
 
 # --- get_texture ---
@@ -528,6 +538,7 @@ def get_texture(
     channel      : int   = -1,
     black_point  : float = 0.0,
     white_point  : float = 1.0,
+    instance     : str | None = None,
 ) -> list:
     """Capture a texture or render target as a viewable image.
 
@@ -570,13 +581,19 @@ def get_texture(
     white_point: High end of the value range mapped to white (default
                  1.0). For HDR textures, values above this are clamped.
     """
-    resp = _client.send("get_texture", {
+    if not _pool.aliases:
+        try:
+            _pool.ensure_connected()
+        except ConnectionError as e:
+            return [TextContent(type="text", text=json.dumps(
+                {"ok": False, "error": str(e)}))]
+    resp = _pool.send("get_texture", {
         "resource_id" : resource_id,
         "event_id"    : event_id,
         "mip"         : mip,
         "slice"       : slice,
         "sample"      : sample,
-    })
+    }, alias=instance)
 
     if not resp.get("ok"):
         return [TextContent(
@@ -750,41 +767,50 @@ def instance(
     port   : int | None = None,
     file   : str | None = None,
     force  : bool       = False,
+    alias  : str | None = None,
 ) -> dict:
     """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
-    Live instances are running ``qrenderdoc`` UIs that loaded the
-    extension. Headless instances are subprocess workers spawned by
-    this tool that load a .rdc file directly via ``renderdoccmd
-    remoteserver``. Both speak the same protocol and appear in the
-    ``list`` output; the ``headless`` field distinguishes them.
+    Connections are tracked by alias in a pool, so multiple instances can
+    be queried side-by-side (e.g. baseline vs broken capture). When only
+    one connection is active it is used automatically and you can omit
+    ``alias=``.
 
-    action  : One of:
-              - ``list``       : Probe the agentic port range for active instances
-                                 (live + headless workers). Returns metadata for each.
-              - ``discover``   : Scan known capture-dump locations for .rdc files
-                                 the agent could open. Does not spawn anything.
-              - ``open``       : Spawn a headless worker for ``file`` and connect
-                                 to it. The worker runs renderdoccmd remoteserver
-                                 in a child process.
-              - ``connect``    : Connect to an already-running instance on ``port``.
-              - ``disconnect`` : Drop the active connection. Does not stop the
-                                 underlying instance (use ``close`` for headless).
-              - ``close``      : Stop a headless worker spawned by this server.
-                                 Optionally ``force=True`` to SIGKILL immediately.
+    action : One of:
+             - ``list``        : Probe the agentic port range for active
+                                 instances. Returns metadata for each,
+                                 annotated with pool alias / headless flag.
+             - ``discover``    : Scan known capture-dump locations for
+                                 .rdc files. Does not spawn anything.
+             - ``connect``     : Connect to a running bridge on ``port``.
+                                 Registers under ``alias`` (auto-derived
+                                 from the capture filename if omitted).
+             - ``open``        : Spawn a headless worker for ``file`` via
+                                 ``renderdoccmd remoteserver``, register
+                                 it under ``alias``.
+             - ``disconnect``  : Drop the named connection. Does NOT kill
+                                 the underlying instance.
+             - ``close``       : Stop a headless worker we spawned and
+                                 drop its connection. Optionally
+                                 ``force=True`` to SIGKILL immediately.
+             - ``set_default`` : Pin a default alias so calls without
+                                 ``instance=`` route to it.
 
-    port    : Port to connect to / close. Required for ``connect`` and ``close``.
-    file    : Path to a .rdc capture file. Required for ``open``.
-    force   : For ``close``: skip graceful shutdown and SIGKILL immediately.
+    port    : Port for connect.
+    file    : .rdc path for open.
+    force   : For close: skip graceful shutdown and SIGKILL immediately.
+    alias   : Pool alias. For connect/open: name to register under
+              (auto-derived from capture filename if omitted). For
+              disconnect/close/set_default: which alias to target. If
+              omitted with exactly one connection active, that one is used.
 
-    Capture discovery directories default to ``/tmp/RenderDoc`` (Linux) or
-    ``%TEMP%\\RenderDoc`` (Windows). Add extra paths via the
+    Capture discovery directories default to ``/tmp/RenderDoc`` (Linux)
+    or ``%TEMP%\\RenderDoc`` (Windows). Add extra paths via the
     ``AGENTIC_RENDERDOC_CAPTURE_DIRS`` env var (os.pathsep-separated).
     """
     if action == "list":
-        # Reap any dead workers so they don't show up as zombie ports.
-        _client.reap_dead_workers()
-        return _enrich_instances(_client.discover_instances())
+        _pool.reap_dead()
+        return {"instances": _pool.discover_instances(enrich=True)}
 
     if action == "discover":
         return {"captures": _discover_captures()}
@@ -793,47 +819,42 @@ def instance(
         if not file:
             return {"ok": False, "error": "file is required for open"}
         try:
-            spawn = _client.spawn_headless_worker(file)
+            spawn = _pool.open(file, alias=alias)
         except RuntimeError as e:
             return {"ok": False, "error": str(e)}
-
-        # Connect to the new worker.
-        _client.connect(spawn["port"])
-        info = spawn["info"]
-        return {
-            "ok"          : True,
-            "port"        : spawn["port"],
-            "remote_port" : spawn["remote_port"],
-            "pid"         : spawn["pid"],
-            "info"        : info,
-        }
+        return {"ok": True, **spawn}
 
     if action == "connect":
         if port is None:
             return {"ok": False, "error": "port is required for connect"}
-        _client.connect(port)
-        info = _client.send("instance_info", {})
-        # If instance_info itself failed (worker_timeout / worker_dead),
-        # propagate the structured error untouched. Don't graft
-        # other_instances onto an error response.
-        if not info.get("ok"):
-            return info
-        others = [
-            inst for inst in _client.discover_instances()
-            if inst["port"] != port
-        ]
-        if others:
-            info["other_instances"] = _enrich_instances(others)["instances"]
-        return info
+        try:
+            info = _pool.connect(port, alias=alias)
+        except (ConnectionError, OSError) as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, **info, "connections": _pool.connection_info()}
 
     if action == "disconnect":
-        _client.disconnect()
-        return {"status": "disconnected"}
+        try:
+            dropped = _pool.disconnect(alias=alias)
+        except KeyError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "disconnected": dropped,
+                "connections": _pool.connection_info()}
 
     if action == "close":
-        if port is None:
-            return {"ok": False, "error": "port is required for close"}
-        return _client.close_headless_worker(port, force=force)
+        try:
+            return _pool.close(alias=alias, force=force)
+        except KeyError as e:
+            return {"ok": False, "error": str(e)}
+
+    if action == "set_default":
+        if alias is None:
+            return {"ok": False, "error": "alias is required for set_default"}
+        try:
+            _pool.set_default(alias)
+        except KeyError as e:
+            return {"ok": False, "error": str(e)}
+        return {"ok": True, "default": alias}
 
     return {"ok": False, "error": f"unknown action: {action}"}
 
@@ -899,40 +920,3 @@ def _captured_program(filename: str) -> str | None:
     return m.group("exe")
 
 
-def _enrich_instances(instances: list[dict]) -> dict:
-    """Probe each discovered instance for metadata.
-
-    Attempts a temporary connection to each instance to fetch instance_info
-    (capture state, API type, etc.). Falls back to port-only info if the
-    probe fails.
-    """
-    enriched = []
-    for inst in instances:
-        port = inst["port"]
-        # If we are already connected to this port, query directly.
-        if _client._port == port and _client._sock is not None:
-            try:
-                info = _client.send("instance_info", {})
-                if info.get("ok") and "data" in info:
-                    enriched.append(info["data"])
-                else:
-                    enriched.append({"port": port})
-            except Exception:
-                enriched.append({"port": port})
-            continue
-
-        # Otherwise, open a temporary connection to probe.
-        probe = RenderDocClient()
-        try:
-            probe.connect(port)
-            info = probe.send("instance_info", {})
-            if info.get("ok") and "data" in info:
-                enriched.append(info["data"])
-            else:
-                enriched.append({"port": port})
-        except Exception:
-            enriched.append({"port": port})
-        finally:
-            probe.disconnect()
-
-    return {"instances": enriched}
