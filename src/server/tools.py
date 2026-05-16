@@ -90,7 +90,8 @@ _CAPTURE_NAME_RE = re.compile(
 
 @mcp.tool(name="Eval")
 def eval(code: str, instance: str | None = None,
-         async_mode: bool = False, timeout: float = 300.0) -> dict:
+         async_mode: bool = False, timeout: float = 300.0,
+         dry_run: bool = False) -> dict:
     """Execute Python code in a live RenderDoc replay session.
 
     This is your primary interface for all GPU capture inspection, analysis,
@@ -614,6 +615,18 @@ def eval(code: str, instance: str | None = None,
     Omit instance= when only one connection is active. Use
     Instance(action='list') to see available aliases.
 
+    DRY RUN
+    =======
+    Pass ``dry_run=True`` to parse the code, walk the AST, and report
+    any unbound names — typos, forgotten imports, references to
+    utilities that don't exist — without executing anything. Useful
+    before a long codeblock that would otherwise pay for a SetFrameEvent
+    just to discover you misspelled ``descrbie_draw``. Returns
+    {parsed, statements, free_names, unbound, unbound_at}. Free of
+    syntax errors and unbound names means the code at least *resolves*;
+    runtime exceptions (NoneType attribute access, etc.) still happen
+    only on a real call.
+
     ASYNC MODE
     ==========
     For long-running operations (large buffer scans, full-frame pixel
@@ -641,15 +654,19 @@ def eval(code: str, instance: str | None = None,
         except ConnectionError as e:
             return {"ok": False, "error": str(e)}
 
+    params = {"code": code}
+    if dry_run:
+        params["dry_run"] = True
+
     if async_mode:
         try:
-            task_id = _start_task("eval", {"code": code},
+            task_id = _start_task("eval", params,
                                   alias=instance, timeout=timeout)
             return {"task_id": task_id, "status": "pending"}
         except (ConnectionError, KeyError) as e:
             return {"ok": False, "error": str(e)}
 
-    return _pool.send("eval", {"code": code}, alias=instance)
+    return _pool.send("eval", params, alias=instance)
 
 
 # --- search_api ---

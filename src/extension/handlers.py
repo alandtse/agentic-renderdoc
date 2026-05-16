@@ -38,7 +38,10 @@ def handler(
     "eval",
     description="Execute Python code in the RenderDoc environment.",
     schema={
-        "properties": {"code": {"type": "string", "description": "Python code to execute."}},
+        "properties": {
+            "code"    : {"type": "string",  "description": "Python code to execute."},
+            "dry_run" : {"type": "boolean", "description": "If True, parse the code and resolve names against the eval namespace but do not execute. Catches typos and NameErrors before paying for a SetFrameEvent."},
+        },
         "required":   ["code"],
     },
 )
@@ -48,6 +51,11 @@ def handle_eval(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     Builds a namespace with RenderDoc globals and utility modules, runs the
     code, serializes the result for JSON transport, and captures any print
     output. Returns error info with contextual hints on failure.
+
+    When dry_run is set, the code is parsed and statically checked for
+    unbound names against the live eval namespace, but no statement is
+    executed. Lets the agent validate a long code block before paying
+    for a SetFrameEvent or other expensive replay.
     """
     code = params.get("code", "")
     if not code:
@@ -56,6 +64,9 @@ def handle_eval(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     # Build the execution namespace with utilities and RenderDoc globals.
     captured_output = []
     namespace       = _build_namespace(ctx, captured_output)
+
+    if params.get("dry_run"):
+        return _dry_run(code, namespace)
 
     try:
         raw_result = _exec_with_result(code, namespace)
@@ -747,6 +758,129 @@ def _build_namespace(ctx: Any, captured_output: List[str]) -> Dict[str, Any]:
     ns["print"] = _capture_print
 
     return ns
+
+
+def _dry_run(code: str, namespace: Dict[str, Any]) -> Dict[str, Any]:
+    """Parse + static-check user code without executing it.
+
+    Verifies the code parses, then walks the AST collecting free names
+    (identifiers that aren't bound by an assignment / import / function
+    or class def inside the snippet). Any that aren't in the eval
+    namespace or Python builtins are reported as likely typos.
+
+    Caller has already established the namespace via _build_namespace,
+    so this catches everything that wouldn't resolve at runtime — typos,
+    forgotten imports, references to utilities that don't exist —
+    without paying for any ctx.replay() or SetFrameEvent.
+    """
+    import ast
+    import builtins
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return {
+            "ok"    : False,
+            "error" : {
+                "kind"         : "syntax",
+                "message"      : str(e),
+                "line"         : e.lineno,
+                "column"       : e.offset,
+                "failing_line" : (e.text or "").rstrip("\n"),
+            },
+        }
+
+    bound  = set()  # type: set
+    free   = []     # type: List[str]
+    free_lines = {} # type: Dict[str, int]
+
+    class _Walker(ast.NodeVisitor):
+        def _bind(self, name):
+            bound.add(name)
+
+        def visit_Assign(self, node):
+            for target in node.targets:
+                for n in ast.walk(target):
+                    if isinstance(n, ast.Name):
+                        self._bind(n.id)
+            self.generic_visit(node)
+
+        def visit_AugAssign(self, node):
+            if isinstance(node.target, ast.Name):
+                self._bind(node.target.id)
+            self.generic_visit(node)
+
+        def visit_AnnAssign(self, node):
+            if isinstance(node.target, ast.Name):
+                self._bind(node.target.id)
+            self.generic_visit(node)
+
+        def visit_For(self, node):
+            for n in ast.walk(node.target):
+                if isinstance(n, ast.Name):
+                    self._bind(n.id)
+            self.generic_visit(node)
+
+        def visit_FunctionDef(self, node):
+            self._bind(node.name)
+            for arg in node.args.args + node.args.kwonlyargs:
+                self._bind(arg.arg)
+            if node.args.vararg:
+                self._bind(node.args.vararg.arg)
+            if node.args.kwarg:
+                self._bind(node.args.kwarg.arg)
+            self.generic_visit(node)
+
+        def visit_AsyncFunctionDef(self, node):
+            self.visit_FunctionDef(node)
+
+        def visit_ClassDef(self, node):
+            self._bind(node.name)
+            self.generic_visit(node)
+
+        def visit_Import(self, node):
+            for alias in node.names:
+                self._bind((alias.asname or alias.name).split(".")[0])
+
+        def visit_ImportFrom(self, node):
+            for alias in node.names:
+                self._bind(alias.asname or alias.name)
+
+        def visit_Lambda(self, node):
+            for arg in node.args.args + node.args.kwonlyargs:
+                self._bind(arg.arg)
+            self.generic_visit(node)
+
+        def visit_comprehension(self, node):
+            for n in ast.walk(node.target):
+                if isinstance(n, ast.Name):
+                    self._bind(n.id)
+
+        def visit_Name(self, node):
+            if isinstance(node.ctx, ast.Load):
+                if node.id not in bound and node.id not in free_lines:
+                    free.append(node.id)
+                    free_lines[node.id] = node.lineno
+
+    _Walker().visit(tree)
+
+    available = set(namespace) | set(dir(builtins))
+    unbound = [n for n in free if n not in available]
+
+    response = {
+        "ok"   : True,
+        "data" : {
+            "parsed"       : True,
+            "statements"   : len(tree.body),
+            "free_names"   : sorted(set(free)),
+            "unbound"      : sorted(set(unbound)),
+        },
+    }
+    if unbound:
+        hints = ["use search_api(...) to find the right symbol"]
+        response["data"]["hints"]      = hints
+        response["data"]["unbound_at"] = {n: free_lines[n] for n in unbound}
+    return response
 
 
 def _exec_with_result(code: str, namespace: Dict[str, Any]) -> Any:
