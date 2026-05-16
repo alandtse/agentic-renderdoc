@@ -668,6 +668,151 @@ def make_get_all_actions(ctx: Any) -> Callable[..., List[dict]]:
 
 # --- Draw Call Summary ---
 
+def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
+    """Snapshot pipeline state and draw params at one event.
+
+    Shared body used by both ``describe_draw`` and ``describe_draws``.
+    Caller must already hold an active controller (inside a
+    ctx.replay() callback). SetFrameEvent is the expensive op here;
+    everything after it is cheap lookups.
+    """
+    from . import serialize
+
+    ctrl.SetFrameEvent(eventId, True)
+    state = ctrl.GetPipelineState()
+
+    action = _find_action(ctrl.GetRootActions(), eventId)
+    name   = action.GetName(structured_file) if action else None
+
+    stages = [
+        ("vs", rd.ShaderStage.Vertex),
+        ("hs", rd.ShaderStage.Hull),
+        ("ds", rd.ShaderStage.Domain),
+        ("gs", rd.ShaderStage.Geometry),
+        ("ps", rd.ShaderStage.Pixel),
+        ("cs", rd.ShaderStage.Compute),
+    ]
+    shaders = {}
+    for label, stage in stages:
+        shader = state.GetShader(stage)
+        if int(shader) != 0:
+            shaders[label] = serialize.resource_id(shader)
+
+    render_targets = []
+    try:
+        for rt in state.GetOutputTargets():
+            if int(rt.resource) != 0:
+                render_targets.append(serialize.resource_id(rt.resource))
+    except Exception:
+        pass
+
+    depth_target = None
+    try:
+        depth = state.GetDepthTarget()
+        if depth and int(depth.resource) != 0:
+            depth_target = serialize.resource_id(depth.resource)
+    except Exception:
+        pass
+
+    draw_params = None
+    if action and (action.flags & rd.ActionFlags.Drawcall):
+        draw_params = {
+            "numIndices"     : action.numIndices,
+            "numInstances"   : action.numInstances,
+            "indexOffset"    : action.indexOffset,
+            "baseVertex"     : action.baseVertex,
+            "instanceOffset" : action.instanceOffset,
+        }
+
+    vertex_buffers = []
+    try:
+        for vb in state.GetVBuffers():
+            if int(vb.resourceId) != 0:
+                vertex_buffers.append({
+                    "resource" : serialize.resource_id(vb.resourceId),
+                    "offset"   : vb.byteOffset,
+                    "stride"   : vb.byteStride,
+                })
+    except Exception:
+        pass
+
+    index_buffer = None
+    try:
+        ib = state.GetIBuffer()
+        if int(ib.resourceId) != 0:
+            index_buffer = {
+                "resource" : serialize.resource_id(ib.resourceId),
+                "offset"   : ib.byteOffset,
+                "stride"   : ib.byteStride,
+            }
+    except Exception:
+        pass
+
+    push_constants = None
+    try:
+        vk_state = ctrl.GetVulkanPipelineState()
+        data     = vk_state.pushconsts
+        if data:
+            push_constants = data.hex()
+    except Exception:
+        pass
+
+    return {
+        "event_id"       : eventId,
+        "name"           : name,
+        "shaders"        : shaders,
+        "render_targets" : render_targets,
+        "depth_target"   : depth_target,
+        "draw_params"    : draw_params,
+        "vertex_buffers" : vertex_buffers,
+        "index_buffer"   : index_buffer,
+        "push_constants" : push_constants,
+    }
+
+
+def make_describe_draws(ctx: Any) -> Callable[..., List[dict]]:
+    """Batched describe_draw — snapshots N events in ONE ctx.replay().
+
+    Each SetFrameEvent forces a full GPU frame replay from event 0 to
+    the target event (per Eval's PERFORMANCE AND STABILITY warning).
+    Naively calling describe_draw(N times) issues N separate
+    BlockInvoke trips; this utility collapses them into one outer
+    callback so the replay-thread overhead is paid once, then the
+    per-event SetFrameEvent+state-snapshot sequence runs back-to-back.
+
+    Suggested upper bound: ~20 events per call. The serial cost of
+    SetFrameEvent is still O(N), and any single hung replay will
+    block the whole batch.
+    """
+    def describe_draws(event_ids: List[int],
+                       controller: Any = None) -> List[dict]:
+        """Summarize pipeline state at each event in event_ids.
+
+        Returns a list of describe_draw results in the same order as
+        event_ids. Events that can't be located in the action tree
+        still get a SetFrameEvent + state snapshot but with name=None.
+
+        event_ids  -- List of integer event IDs to snapshot.
+        controller -- Optional ReplayController if already inside
+                      ctx.replay(); auto-dispatched otherwise.
+        """
+        if not event_ids:
+            return []
+
+        def _batch(ctrl: Any) -> List[dict]:
+            return [_describe_one(ctrl, ctx.structured_file, int(eid))
+                    for eid in event_ids]
+
+        if controller is not None:
+            return _batch(controller)
+        active = ctx._replay_controller
+        if active is not None:
+            return _batch(active)
+        return ctx.replay(_batch)
+
+    return describe_draws
+
+
 def make_describe_draw(ctx: Any) -> Callable[..., dict]:
     """Create a describe_draw function bound to the given HandlerContext.
 
@@ -701,104 +846,7 @@ def make_describe_draw(ctx: Any) -> Callable[..., dict]:
             return {"error": "eventId is required"}
 
         def _describe(ctrl: Any) -> dict:
-            ctrl.SetFrameEvent(eventId, True)
-            state = ctrl.GetPipelineState()
-
-            # Find the action to get its name and draw parameters.
-            action = _find_action(ctrl.GetRootActions(), eventId)
-            name   = action.GetName(ctx.structured_file) if action else None
-
-            # Bound shaders by stage.
-            stages = [
-                ("vs", rd.ShaderStage.Vertex),
-                ("hs", rd.ShaderStage.Hull),
-                ("ds", rd.ShaderStage.Domain),
-                ("gs", rd.ShaderStage.Geometry),
-                ("ps", rd.ShaderStage.Pixel),
-                ("cs", rd.ShaderStage.Compute),
-            ]
-            shaders = {}
-            for label, stage in stages:
-                shader = state.GetShader(stage)
-                if int(shader) != 0:
-                    shaders[label] = serialize.resource_id(shader)
-
-            # Render targets.
-            render_targets = []
-            try:
-                for rt in state.GetOutputTargets():
-                    if int(rt.resource) != 0:
-                        render_targets.append(serialize.resource_id(rt.resource))
-            except Exception:
-                pass
-
-            # Depth target.
-            depth_target = None
-            try:
-                depth = state.GetDepthTarget()
-                if depth and int(depth.resource) != 0:
-                    depth_target = serialize.resource_id(depth.resource)
-            except Exception:
-                pass
-
-            # Draw parameters from the action.
-            draw_params = None
-            if action and (action.flags & rd.ActionFlags.Drawcall):
-                draw_params = {
-                    "numIndices"     : action.numIndices,
-                    "numInstances"   : action.numInstances,
-                    "indexOffset"    : action.indexOffset,
-                    "baseVertex"     : action.baseVertex,
-                    "instanceOffset" : action.instanceOffset,
-                }
-
-            # Vertex buffers.
-            vertex_buffers = []
-            try:
-                for vb in state.GetVBuffers():
-                    if int(vb.resourceId) != 0:
-                        vertex_buffers.append({
-                            "resource" : serialize.resource_id(vb.resourceId),
-                            "offset"   : vb.byteOffset,
-                            "stride"   : vb.byteStride,
-                        })
-            except Exception:
-                pass
-
-            # Index buffer.
-            index_buffer = None
-            try:
-                ib = state.GetIBuffer()
-                if int(ib.resourceId) != 0:
-                    index_buffer = {
-                        "resource" : serialize.resource_id(ib.resourceId),
-                        "offset"   : ib.byteOffset,
-                        "stride"   : ib.byteStride,
-                    }
-            except Exception:
-                pass
-
-            # Push constants (Vulkan only).
-            push_constants = None
-            try:
-                vk_state = ctrl.GetVulkanPipelineState()
-                data     = vk_state.pushconsts
-                if data:
-                    push_constants = data.hex()
-            except Exception:
-                pass
-
-            return {
-                "event_id"       : eventId,
-                "name"           : name,
-                "shaders"        : shaders,
-                "render_targets" : render_targets,
-                "depth_target"   : depth_target,
-                "draw_params"    : draw_params,
-                "vertex_buffers" : vertex_buffers,
-                "index_buffer"   : index_buffer,
-                "push_constants" : push_constants,
-            }
+            return _describe_one(ctrl, ctx.structured_file, eventId)
 
         # If a controller was passed explicitly, use it directly.
         if controller is not None:
@@ -1139,6 +1187,7 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "get_all_actions"      : make_get_all_actions(ctx),
         "find_marker"          : make_find_marker(ctx),
         "describe_draw"        : make_describe_draw(ctx),
+        "describe_draws"       : make_describe_draws(ctx),
         "goto_event"           : make_goto_event(ctx),
         "view_texture"         : make_view_texture(ctx),
         "save_texture"         : make_save_texture(ctx),

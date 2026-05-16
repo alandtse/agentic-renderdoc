@@ -418,6 +418,12 @@ def eval(code: str, instance: str | None = None,
             ``markers_only=True`` to skip leaf draws. Skip the manual
             recursive walk.
 
+        describe_draws(event_ids)
+            Batched describe_draw — snapshots N events in ONE ctx.replay()
+            so the BlockInvoke / replay-thread overhead is paid once
+            instead of N times. Per-event SetFrameEvent is still O(N)
+            and serial. Suggested cap: ~20 events per call.
+
         describe_draw(eventId=eid)
             (keyword-only — `describe_draw(eid)` raises.)
             One-shot comprehensive summary of a draw call. Returns event_id,
