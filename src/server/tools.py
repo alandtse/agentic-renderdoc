@@ -97,6 +97,28 @@ def eval(code: str, instance: str | None = None,
     and debugging. Code runs inside RenderDoc's embedded Python interpreter
     with full access to the replay engine.
 
+    WHEN TO REACH FOR RENDERDOC (vs Tracy)
+    ======================================
+    If a Tracy MCP is also available (``mcp__tracy__*``), the two tools
+    are complementary, not redundant:
+
+      - Tracy gives you frame-level / zone-level CPU+GPU timing, lock
+        contention, memory deltas. Reach for it first when the question
+        is "what is slow?", "what is blocked on what?", or "did this
+        change regress perf?".
+
+      - RenderDoc gives you a single-frame state snapshot — every draw
+        call, pipeline state, bound resource, and pixel. Reach for it
+        when the question is "what is this draw doing?", "what is bound
+        here?", or "why does this pixel look wrong?".
+
+    Typical paired workflow: use Tracy to find the suspicious zone,
+    then open or capture the matching frame in RenderDoc to inspect
+    GPU state inside it. Don't try to answer perf-style questions with
+    RenderDoc's per-draw counters until Tracy has narrowed the window —
+    the cost of replaying a whole frame to get those numbers is wasted
+    if Tracy already shows the answer at the zone level.
+
     ACCESS MODEL
     ============
     The global `ctx` (HandlerContext) provides thread-safe replay access.
