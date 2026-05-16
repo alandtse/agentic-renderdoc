@@ -626,6 +626,73 @@ def handle_shutdown(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
 
 # --- Internal helpers ---
 
+# Methods on qrenderdoc.CaptureContext that mutate UI/replay state and MUST
+# run on the Qt UI thread. Calling them from Eval (which runs on the bridge
+# handler thread) crashes RenderDoc — Qt has no thread-affinity check in
+# release builds. The proxy below intercepts them and points the agent at
+# the Instance() actions, which route through invoke_ui correctly.
+_CTX_FORBIDDEN_FROM_EVAL = {
+    "LoadCapture"  : "use Instance(action='load_capture', file=...) — raw LoadCapture re-enters the replay lifecycle and deadlocks",
+    "CloseCapture" : "use Instance(action='close_capture') — raw CloseCapture runs off the Qt UI thread and crashes RenderDoc (observed CTD)",
+}
+
+
+class _SafeCaptureContext(object):
+    """Proxy for qrenderdoc.CaptureContext that intercepts known footguns.
+
+    Forwards everything else (Config(), Replay(), GetCaptureFilename(),
+    GetStructuredFile(), …) untouched. Only the methods listed in
+    _CTX_FORBIDDEN_FROM_EVAL raise with a redirect to the safe MCP path.
+    """
+
+    def __init__(self, real):
+        object.__setattr__(self, "_real", real)
+
+    def __getattr__(self, name):
+        if name in _CTX_FORBIDDEN_FROM_EVAL:
+            redirect = _CTX_FORBIDDEN_FROM_EVAL[name]
+            def _refuse(*args, **kwargs):
+                raise RuntimeError(
+                    "ctx.ctx.{}() is not safe from Eval: {}".format(name, redirect)
+                )
+            return _refuse
+        return getattr(self._real, name)
+
+    def __dir__(self):
+        return sorted(set(dir(self._real)) | set(_CTX_FORBIDDEN_FROM_EVAL))
+
+
+class _EvalHandlerContext(object):
+    """Proxy for HandlerContext exposed to user code in Eval.
+
+    On GUI contexts, routes the ``.ctx`` attribute through
+    _SafeCaptureContext so the documented footguns are intercepted. On
+    headless contexts, there is no Qt CaptureContext to wrap — the
+    proxy is a pass-through. All other attributes (replay, invoke_ui,
+    capture_loaded, structured_file, …) forward to the real
+    HandlerContext unchanged so pre-loaded utilities and ctx.replay()
+    keep working exactly as before.
+    """
+
+    def __init__(self, real):
+        object.__setattr__(self, "_real", real)
+        real_ctx = getattr(real, "ctx", None)
+        if real_ctx is not None and not getattr(real, "headless", False):
+            object.__setattr__(self, "_safe_ctx", _SafeCaptureContext(real_ctx))
+        else:
+            object.__setattr__(self, "_safe_ctx", real_ctx)
+
+    @property
+    def ctx(self):
+        return self._safe_ctx
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def __dir__(self):
+        return dir(self._real)
+
+
 def _build_namespace(ctx: Any, captured_output: List[str]) -> Dict[str, Any]:
     """Build the execution namespace for eval, including utilities.
 
@@ -636,7 +703,10 @@ def _build_namespace(ctx: Any, captured_output: List[str]) -> Dict[str, Any]:
     ctx             -- HandlerContext shared with all handlers.
     captured_output -- Mutable list; print calls append strings here.
     """
-    ns = {"ctx": ctx}
+    # Expose a guarded view of HandlerContext: pre-loaded utilities still
+    # bind to the raw ctx via closure (bind_utilities below), so this only
+    # affects user-typed code that touches ctx.ctx directly.
+    ns = {"ctx": _EvalHandlerContext(ctx)}
 
     # RenderDoc modules are available globally inside the extension environment.
     # Import them into the namespace so eval code can use them directly.
