@@ -241,6 +241,42 @@ imports before they hit a 60s replay timeout.
 """,
     },
 
+    # --- Pixel debugging ---
+    {
+        "name"      : "concept:pixel_debugger_workflow",
+        "kind"      : "concept",
+        "signature" : "pixel_history → debug_pixel",
+        "doc"       : """\
+Two-step "why is this pixel this colour" workflow:
+
+  1. Identify the draws that touched it:
+
+        pixel_history("ResourceId(123)", x=512, y=384, event_id=900)
+        # -> {'events': [
+        #       {'event_id': 412, 'frag_index': 0, 'primitive_id': 5,
+        #        'pre':  {'col': [0,0,0,1]},
+        #        'shader_out': {'col': [0.5, 0.0, 0.0, 1.0]},
+        #        'post': {'col': [0.5, 0.0, 0.0, 1.0]},
+        #        'failed_tests': []},
+        #       …]}
+
+     Look for the event that wrote the wrong value, or for tests that
+     unexpectedly culled the fragment (depth_test_failed,
+     shader_discarded, scissor_clipped, …).
+
+  2. Step into the offending pixel shader:
+
+        debug_pixel(event_id=412, x=512, y=384)
+        # -> {'had_trace': True, 'has_source': True,
+        #     'inputs': [{'name': 'TEXCOORD0', 'value': [0.5, 0.5]}, ...],
+        #     'constant_blocks': [...], 'readonly_resources': [...]}
+
+For full per-step inspection use ctrl.DebugPixel /
+ctrl.ContinueDebug directly inside ctx.replay() — the utility
+auto-frees the trace handle so it can't be reused for stepping.
+""",
+    },
+
     # --- Safety ---
     {
         "name"      : "concept:dont_load_or_close_from_eval",

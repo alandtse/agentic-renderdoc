@@ -722,6 +722,302 @@ def decode_push_constants(controller: Any, stage: Any) -> dict:
     return result
 
 
+def make_pixel_history(ctx: Any) -> Callable[..., dict]:
+    """Create a pixel_history function bound to the given HandlerContext.
+
+    "Which draws wrote to this pixel and how?" is the canonical first
+    question when chasing a wrong-colour bug. RenderDoc's PixelHistory
+    API answers it: every event that touched the pixel, with pre / post
+    values, whether the fragment was culled / discarded / depth-failed,
+    and the primitive ID.
+
+    Wrapping it removes the ResourceId + Subresource + CompType
+    boilerplate every cold-start agent writes from scratch.
+    """
+    def pixel_history(resource_id : Any,
+                      x           : int,
+                      y           : int,
+                      mip         : int           = 0,
+                      slice_index : int           = 0,
+                      sample      : int           = 0,
+                      event_id    : Optional[int] = None,
+                      controller  : Any           = None) -> dict:
+        """Trace every event that modified the pixel at (x, y).
+
+        Coords are top-left convention regardless of API (RenderDoc
+        normalises GL). Returns one entry per modifying event, with
+        pre/shaderOut/post values and per-test culling flags.
+
+        Safe to call both inside and outside a ctx.replay() callback.
+
+        resource_id -- Texture to query (int, decimal str, or rd.ResourceId).
+        x, y        -- Pixel coordinates (top-left origin).
+        mip         -- Mip level (default 0).
+        slice_index -- Array slice / cube face (default 0).
+        sample      -- Multisample sample index (default 0).
+        event_id    -- Optional event to SetFrameEvent before the query.
+                       Most textures are content-independent of cursor
+                       position, but render targets are not.
+        controller  -- Optional ReplayController if already inside
+                       ctx.replay(); auto-dispatched otherwise.
+
+        Returns:
+            {
+              "resource"      : "ResourceId(…)",
+              "x"             : 512,
+              "y"             : 384,
+              "events"        : [ { event_id, primitiveID, fragIndex,
+                                    pre, shaderOut, post,
+                                    failed_tests: [...] }, … ]
+            }
+        """
+        if hasattr(resource_id, "__int__"):
+            try:
+                target_id = int(resource_id)
+            except Exception:
+                target_id = None
+        elif isinstance(resource_id, str):
+            try:
+                target_id = int(resource_id)
+            except ValueError:
+                target_id = None
+        else:
+            target_id = None
+        if target_id is None:
+            return {"error": "resource_id must be an int, decimal str, or rd.ResourceId"}
+
+        from . import serialize
+
+        def _do(ctrl: Any) -> dict:
+            if event_id is not None:
+                ctrl.SetFrameEvent(int(event_id), True)
+
+            tex = None
+            for t in ctrl.GetTextures():
+                if int(t.resourceId) == target_id:
+                    tex = t
+                    break
+            if tex is None:
+                return {"error": "no texture with resource id {}".format(target_id)}
+
+            sub = rd.Subresource(mip, slice_index, sample)
+            try:
+                hist = ctrl.PixelHistory(tex.resourceId, int(x), int(y),
+                                         sub, rd.CompType.Typeless)
+            except Exception as e:
+                return {"error": "PixelHistory failed: {}".format(e)}
+
+            def _mod_to_dict(mv):
+                # ModificationValue has col[4], depth, stencil.
+                try:
+                    col = [float(c) for c in mv.col]
+                except Exception:
+                    col = None
+                return {
+                    "col"     : col,
+                    "depth"   : getattr(mv, "depth",   None),
+                    "stencil" : getattr(mv, "stencil", None),
+                }
+
+            test_fields = (
+                "sampleMasked", "backfaceCulled", "depthClipped",
+                "depthBoundsFailed", "viewClipped", "scissorClipped",
+                "shaderDiscarded", "depthTestFailed", "stencilTestFailed",
+            )
+
+            events = []
+            for pm in hist:
+                failed = [t for t in test_fields if getattr(pm, t, False)]
+                events.append({
+                    "event_id"          : int(pm.eventId),
+                    "primitive_id"      : int(getattr(pm, "primitiveID", -1)),
+                    "frag_index"        : int(getattr(pm, "fragIndex", -1)),
+                    "direct_write"      : bool(getattr(pm, "directShaderWrite", False)),
+                    "unbound_ps"        : bool(getattr(pm, "unboundPS", False)),
+                    "pre"               : _mod_to_dict(pm.preMod),
+                    "shader_out"        : _mod_to_dict(pm.shaderOut),
+                    "post"              : _mod_to_dict(pm.postMod),
+                    "failed_tests"      : failed,
+                })
+
+            return {
+                "resource" : serialize.resource_id(tex.resourceId),
+                "x"        : int(x),
+                "y"        : int(y),
+                "events"   : events,
+            }
+
+        if controller is not None:
+            return _do(controller)
+        active = ctx._replay_controller
+        if active is not None:
+            return _do(active)
+        return ctx.replay(_do)
+
+    return pixel_history
+
+
+def make_debug_pixel(ctx: Any) -> Callable[..., dict]:
+    """Create a debug_pixel function bound to the given HandlerContext.
+
+    Runs RenderDoc's pixel-shader debugger at (x, y) for a specific
+    draw, returns a summary of the resulting ShaderDebugTrace. Manages
+    FreeTrace lifetime so callers can't leak.
+
+    Full step-by-step debugging (ContinueDebug + per-state inspection)
+    is stateful and rare enough that wrapping it would earn less than
+    its weight. The summary surfaces what the agent usually needs:
+    whether the trace exists at all, which inputs were sampled, the
+    bindings the shader saw, and whether source-level mappings are
+    available.
+    """
+    def debug_pixel(event_id   : int,
+                    x          : int,
+                    y          : int,
+                    sample     : int = -1,   # -1 = NoPreference
+                    primitive  : int = -1,
+                    view       : int = -1,
+                    controller : Any = None) -> dict:
+        """Debug the pixel shader at (event_id, x, y).
+
+        Reports a summary of the resulting ShaderDebugTrace. The trace
+        itself is freed before returning — the dict is JSON-safe and
+        no SWIG handles leak across the bridge.
+
+        sample / primitive / view default to NoPreference (random
+        fragment writing to the coord, any primitive, any view).
+
+        Returns:
+            {
+              "event_id"    : 412,
+              "x" / "y"     : 512 / 384,
+              "had_trace"   : True,
+              "num_inputs"  : 8,
+              "num_steps"   : 124,   # if traceable, else None
+              "has_source"  : True,
+              "inputs"      : [ {name, value}, … ],
+              "constant_blocks" : [ {name, resource}, … ],
+              "readonly_resources" : [ {name, resource}, … ]
+            }
+        """
+        from . import serialize
+
+        def _do(ctrl: Any) -> dict:
+            ctrl.SetFrameEvent(int(event_id), True)
+
+            inputs = rd.DebugPixelInputs()
+            try:
+                inputs.sample    = int(sample)
+                inputs.primitive = int(primitive)
+                inputs.view      = int(view)
+            except Exception:
+                # Older RenderDoc builds had a slightly different shape.
+                pass
+
+            trace = None
+            try:
+                trace = ctrl.DebugPixel(int(x), int(y), inputs)
+            except Exception as e:
+                return {"error": "DebugPixel failed: {}".format(e)}
+
+            if trace is None:
+                return {
+                    "event_id"  : int(event_id),
+                    "x"         : int(x),
+                    "y"         : int(y),
+                    "had_trace" : False,
+                    "note"      : "no pixel-shader fragment writes to this coord at this event",
+                }
+
+            try:
+                num_inputs = len(getattr(trace, "inputs", []) or [])
+                num_steps  = None
+                has_source = bool(getattr(trace, "sourceVars", []) or [])
+
+                input_summary = []
+                try:
+                    for v in trace.inputs:
+                        input_summary.append({
+                            "name"  : v.name,
+                            "type"  : getattr(v.type, "name", str(v.type)),
+                            "value" : _shader_var_summary(v),
+                        })
+                except Exception:
+                    pass
+
+                cbs = []
+                try:
+                    for cb in trace.constantBlocks:
+                        cbs.append({
+                            "name"     : cb.name,
+                            "value"    : _shader_var_summary(cb),
+                        })
+                except Exception:
+                    pass
+
+                ros = []
+                try:
+                    for r in getattr(trace, "readOnlyResources", []) or []:
+                        ros.append({
+                            "name"     : getattr(r, "name", None),
+                            "resource" : (serialize.resource_id(r.resourceResourceId)
+                                          if hasattr(r, "resourceResourceId") else None),
+                        })
+                except Exception:
+                    pass
+
+                return {
+                    "event_id"           : int(event_id),
+                    "x"                  : int(x),
+                    "y"                  : int(y),
+                    "had_trace"          : True,
+                    "num_inputs"         : num_inputs,
+                    "num_steps"          : num_steps,
+                    "has_source"         : has_source,
+                    "inputs"             : input_summary,
+                    "constant_blocks"    : cbs,
+                    "readonly_resources" : ros,
+                }
+            finally:
+                try:
+                    ctrl.FreeTrace(trace)
+                except Exception:
+                    pass
+
+        if controller is not None:
+            return _do(controller)
+        active = ctx._replay_controller
+        if active is not None:
+            return _do(active)
+        return ctx.replay(_do)
+
+    return debug_pixel
+
+
+def _shader_var_summary(var: Any) -> Any:
+    """Best-effort summary of a ShaderVariable's value.
+
+    Returns either a flat list of floats (for simple scalars/vectors/
+    matrices), a recursive list (for compound types), or None.
+    """
+    try:
+        members = list(getattr(var, "members", []) or [])
+        if members:
+            return [_shader_var_summary(m) for m in members]
+        # Try float column, falling back to int, then None.
+        for attr in ("value", ):
+            v = getattr(var, attr, None)
+            if v is not None:
+                # ShaderValue exposes f32v, u32v, s32v, etc.
+                for vec in ("f32v", "u32v", "s32v"):
+                    arr = getattr(v, vec, None)
+                    if arr is not None:
+                        return [float(x) for x in arr[:16]]
+    except Exception:
+        pass
+    return None
+
+
 _STAGE_NAMES = {
     "vs"       : "Vertex",
     "vertex"   : "Vertex",
@@ -1532,6 +1828,8 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "interpret_buffer"     : interpret_buffer,
         "summarize_data"       : summarize_data,
         "summarize_texture"    : make_summarize_texture(ctx),
+        "pixel_history"        : make_pixel_history(ctx),
+        "debug_pixel"          : make_debug_pixel(ctx),
         "action_flags"         : action_flags,
         "decode_push_constants" : decode_push_constants,
     }

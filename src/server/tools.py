@@ -371,6 +371,25 @@ def eval(code: str, instance: str | None = None,
             Compute min, max, mean, count, nan_count, inf_count over
             a flat list of numbers. Quick buffer/texture inspection.
 
+        pixel_history(resource_id, x, y, mip=0, slice_index=0, sample=0,
+                      event_id=None)
+            "Which draws wrote to this pixel and how?" — the canonical
+            first question for wrong-colour bugs. Wraps PixelHistory:
+            returns every modifying event with pre / shaderOut / post
+            values, primitive ID, and per-test culling flags
+            (depth_test_failed, shader_discarded, scissor_clipped, …).
+
+        debug_pixel(event_id, x, y, sample=-1, primitive=-1, view=-1)
+            Run RenderDoc's pixel-shader debugger at (x, y) for a
+            specific draw. Returns a summary of the resulting
+            ShaderDebugTrace — inputs, constant blocks, readonly
+            resources, and whether source-level mappings exist. The
+            trace handle is FreeTrace'd before returning, so no SWIG
+            handles leak. For full step-by-step debugging use
+            ctrl.DebugPixel / ctrl.ContinueDebug directly inside
+            ctx.replay(); this utility is the easy "what did the
+            shader see at this pixel?" path.
+
         summarize_texture(resource_id, event_id=None, mip=0, slice_index=0,
                           channel=None)
             Per-channel min/max/mean/NaN/Inf over texture pixels. First
