@@ -541,6 +541,252 @@ def handle_capture_list(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# --- targets_list / target_trigger_capture ---
+#
+# These talk to a *target* process (e.g. skyrim.exe) via the
+# RenderDoc capture-layer control channel, not to a *replay analyzer*
+# (which is what the rest of the bridge interacts with).
+#
+# rd.EnumerateRemoteTargets("", nextIdent) scans the local machine for
+# RenderDoc-injected processes; rd.CreateTargetControl("", ident, …)
+# opens a control channel. The channel is independent of the bridge's
+# TCP socket and lives only as long as the handler holds it.
+
+@handler(
+    "targets_list",
+    description="Enumerate running processes that have the RenderDoc layer loaded.",
+    schema={
+        "properties": {
+            "host" : {"type": "string", "description": "URL/host to scan (empty = localhost)."},
+        },
+    },
+)
+def handle_targets_list(ctx, params):
+    # type: (Any, Dict[str, Any]) -> Dict[str, Any]
+    """List live capture-control targets on the given host.
+
+    For each ident reported by EnumerateRemoteTargets, opens a quick
+    TargetControl connection to read the executable name, PID, API,
+    and busy-client (if another tool already has the connection
+    open). Each probe Shutdown()s before moving on so we don't keep
+    the target busy.
+    """
+    import renderdoc as rd
+
+    host = params.get("host") or ""
+    client_name = "agentic-renderdoc"
+
+    targets = []
+    next_ident = 0
+    # Hard cap on probes — pathological hosts can otherwise spin.
+    for _ in range(64):
+        try:
+            next_ident = rd.EnumerateRemoteTargets(host, next_ident)
+        except Exception as e:
+            return {"ok": False, "error": "EnumerateRemoteTargets failed: {}".format(e)}
+        if not next_ident:
+            break
+
+        probe = None
+        info = {"ident": int(next_ident)}
+        try:
+            probe = rd.CreateTargetControl(host, int(next_ident),
+                                           client_name, False)
+            if probe is not None:
+                # If another tool has the connection open, RenderDoc reports a
+                # busy_client and the probe is still useful for metadata.
+                try:
+                    info["target"]      = str(probe.GetTarget())
+                except Exception:
+                    pass
+                try:
+                    info["api"]         = str(probe.GetAPI())
+                except Exception:
+                    pass
+                try:
+                    info["pid"]         = int(probe.GetPID())
+                except Exception:
+                    pass
+                try:
+                    busy = str(probe.GetBusyClient())
+                    if busy:
+                        info["busy_client"] = busy
+                except Exception:
+                    pass
+        except Exception as e:
+            info["probe_error"] = str(e)
+        finally:
+            if probe is not None:
+                try:
+                    probe.Shutdown()
+                except Exception:
+                    pass
+
+        targets.append(info)
+
+    return {"ok": True, "data": {"host": host or "localhost", "targets": targets}}
+
+
+@handler(
+    "target_trigger_capture",
+    description="Trigger one or more frame captures on a running target process.",
+    schema={
+        "properties": {
+            "ident"        : {"type": "integer", "description": "Target ident from targets_list. Required."},
+            "host"         : {"type": "string",  "description": "Host of the target. Empty = localhost."},
+            "num_frames"   : {"type": "integer", "description": "How many sequential frames to capture (default 1). Each lands as its own .rdc."},
+            "frame_number" : {"type": "integer", "description": "If set, QueueCapture(frame_number, num_frames) instead of TriggerCapture(num_frames)."},
+            "wait_secs"    : {"type": "number",  "description": "How long to keep the connection open waiting for NewCapture messages. Default 10s. Capped at 300s."},
+            "copy_to"      : {"type": "string",  "description": "Optional local directory. Each capture is CopyCapture()'d to <copy_to>/<remote_basename> after arrival. If omitted, returns the on-target path only."},
+            "force"        : {"type": "boolean", "description": "Pass forceConnection=True to CreateTargetControl. Steals the connection from any currently-attached client. Default False."},
+            "include_thumbnails" : {"type": "boolean", "description": "Include the embedded thumbnail (base64 RGB8) for each arrived capture. Default False."},
+        },
+        "required": ["ident"],
+    },
+)
+def handle_target_trigger_capture(ctx, params):
+    # type: (Any, Dict[str, Any]) -> Dict[str, Any]
+    """Trigger a capture on a running target and wait for the file(s).
+
+    Sequence:
+      1. Open ITargetControl to (host, ident).
+      2. TriggerCapture(num_frames) or QueueCapture(frame_number, num_frames).
+      3. Loop ReceiveMessage(progress=None) up to wait_secs wall-clock,
+         collecting NewCapture messages until num_frames have arrived
+         or the deadline hits.
+      4. (Optional) CopyCapture each arrival to copy_to/.
+      5. Shutdown the control connection.
+
+    Returns a list of arrived captures with on-target path, frame
+    number, captureId, size, and local_path (if copy_to was set).
+
+    The handler runs on the bridge handler thread and holds the
+    _dispatch_lock for its full wait_secs duration — other MCP calls
+    are blocked while this runs. Keep wait_secs modest, or fire from
+    a dedicated tab.
+    """
+    import base64
+    import os
+    import time
+    import renderdoc as rd
+
+    ident = params.get("ident")
+    if not ident:
+        return {"ok": False, "error": "ident is required (see Instance(action='targets'))"}
+
+    host           = params.get("host") or ""
+    num_frames     = max(1, int(params.get("num_frames", 1)))
+    frame_number   = params.get("frame_number")
+    wait_secs      = max(0.5, min(300.0, float(params.get("wait_secs", 10.0))))
+    copy_to        = params.get("copy_to")
+    force          = bool(params.get("force", False))
+    include_thumbs = bool(params.get("include_thumbnails", False))
+
+    if copy_to:
+        if not os.path.isdir(copy_to):
+            return {"ok": False, "error": "copy_to is not a directory: {}".format(copy_to)}
+
+    control = None
+    try:
+        control = rd.CreateTargetControl(host, int(ident),
+                                         "agentic-renderdoc", force)
+    except Exception as e:
+        return {"ok": False, "error": "CreateTargetControl failed: {}".format(e)}
+    if control is None:
+        return {
+            "ok"    : False,
+            "error" : "could not open target control to ident {}; "
+                      "another client may hold it (try force=True)".format(ident),
+        }
+
+    arrived = []
+    try:
+        target_name = ""
+        try:
+            target_name = str(control.GetTarget())
+        except Exception:
+            pass
+
+        try:
+            if frame_number is not None:
+                control.QueueCapture(int(frame_number), num_frames)
+                mode = "queued at frame {}".format(int(frame_number))
+            else:
+                control.TriggerCapture(num_frames)
+                mode = "triggered"
+        except Exception as e:
+            return {"ok": False, "error": "trigger failed: {}".format(e)}
+
+        deadline = time.time() + wait_secs
+        while time.time() < deadline and len(arrived) < num_frames:
+            try:
+                msg = control.ReceiveMessage(None)
+            except Exception as e:
+                return {"ok": False, "error": "ReceiveMessage failed: {}".format(e),
+                        "arrived": arrived}
+
+            if msg is None:
+                continue
+
+            mtype = getattr(msg.type, "name", str(msg.type)) if msg.type is not None else ""
+
+            if mtype == "Disconnected":
+                break
+
+            if mtype != "NewCapture":
+                # Noop, CaptureProgress, RegisterAPI, etc. — keep pumping.
+                continue
+
+            nc = msg.newCapture
+            entry = {
+                "captureId"    : int(nc.captureId),
+                "frameNumber"  : int(nc.frameNumber),
+                "timestamp"    : int(nc.timestamp),
+                "byteSize"     : int(nc.byteSize),
+                "target_path"  : str(nc.path),
+                "title"        : str(getattr(nc, "title", "")),
+                "thumb_width"  : int(getattr(nc, "thumbWidth", 0)),
+                "thumb_height" : int(getattr(nc, "thumbHeight", 0)),
+            }
+            if include_thumbs and nc.thumbnail:
+                try:
+                    entry["thumbnail_rgb8_b64"] = base64.b64encode(
+                        bytes(nc.thumbnail)).decode("ascii")
+                except Exception:
+                    pass
+
+            # Optional CopyCapture to local directory.
+            if copy_to:
+                local_basename = os.path.basename(entry["target_path"]) or \
+                                 "capture_{}.rdc".format(entry["captureId"])
+                local_path = os.path.join(copy_to, local_basename)
+                try:
+                    control.CopyCapture(entry["captureId"], local_path)
+                    entry["local_path"] = local_path
+                except Exception as e:
+                    entry["copy_error"] = str(e)
+
+            arrived.append(entry)
+
+        return {
+            "ok"   : True,
+            "data" : {
+                "ident"       : int(ident),
+                "target"      : target_name,
+                "mode"        : mode,
+                "requested"   : num_frames,
+                "captures"    : arrived,
+                "complete"    : len(arrived) >= num_frames,
+                "waited_secs" : round(wait_secs, 2),
+            },
+        }
+    finally:
+        try:
+            control.Shutdown()
+        except Exception:
+            pass
+
+
 # --- reload (dev only) ---
 
 @handler(

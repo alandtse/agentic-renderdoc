@@ -1128,6 +1128,11 @@ def instance(
     instance_b         : str | None = None,
     eid_start          : int | None = None,
     eid_end            : int | None = None,
+    target_ident       : int | None = None,
+    num_frames         : int        = 1,
+    frame_number       : int | None = None,
+    wait_secs          : float      = 10.0,
+    host               : str | None = None,
 ) -> Any:
     """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
@@ -1188,6 +1193,32 @@ def instance(
                                  search range. Long-running for large
                                  captures — combine with async via the
                                  Task tool.
+             - ``targets``     : Enumerate running processes that have
+                                 the RenderDoc capture layer loaded
+                                 (e.g. skyrim.exe, the editor, …).
+                                 Returns each target's ident, exe name,
+                                 PID, and current API. These are not the
+                                 same thing as analyzer instances —
+                                 they're the live programs you'd ask
+                                 to take a frame capture.
+             - ``trigger_capture``:
+                                 Tell a running target to capture
+                                 ``num_frames`` (default 1) sequential
+                                 frames. Each lands as its own .rdc on
+                                 the target machine; pass ``directory=``
+                                 to also CopyCapture each arrival to a
+                                 local folder. Pass ``frame_number=N``
+                                 to QueueCapture at frame N instead of
+                                 the next presented frame. The handler
+                                 holds the bridge lock for up to
+                                 ``wait_secs`` (default 10, max 300) —
+                                 keep it modest. Combine with async
+                                 via the Task tool for long waits.
+                                 Requires ``target_ident`` from
+                                 Instance(action="targets"); pass
+                                 ``force=True`` to steal the control
+                                 channel from any currently-attached
+                                 RenderDoc UI.
 
     Headless workers refuse load_capture/close_capture/captures — they
     are pinned to the file they were spawned for; use ``open``/``close``
@@ -1303,6 +1334,55 @@ def instance(
             return _find_first_divergence(
                 instance_a, instance_b, eid_start, eid_end,
             )
+        except (ConnectionError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
+
+    if action == "targets":
+        if not _pool.aliases:
+            try:
+                _pool.ensure_connected()
+            except ConnectionError as e:
+                return {"ok": False, "error": str(e)}
+        params: dict = {}
+        if host is not None:
+            params["host"] = host
+        try:
+            return _pool.send("targets_list", params, alias=alias,
+                              read_timeout=30.0)
+        except (ConnectionError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
+
+    if action == "trigger_capture":
+        if target_ident is None:
+            return {
+                "ok"    : False,
+                "error" : "trigger_capture requires target_ident= "
+                          "(get it from Instance(action='targets'))",
+            }
+        if not _pool.aliases:
+            try:
+                _pool.ensure_connected()
+            except ConnectionError as e:
+                return {"ok": False, "error": str(e)}
+        params: dict = {
+            "ident"              : int(target_ident),
+            "num_frames"         : int(num_frames),
+            "wait_secs"          : float(wait_secs),
+            "force"              : bool(force),
+            "include_thumbnails" : bool(thumbnails),
+        }
+        if host is not None:
+            params["host"] = host
+        if frame_number is not None:
+            params["frame_number"] = int(frame_number)
+        if directory is not None:
+            params["copy_to"] = directory
+        try:
+            # Read deadline a hair beyond the handler's max wait so we
+            # don't time the socket out before the handler returns.
+            read_timeout = max(60.0, float(wait_secs) + 15.0)
+            return _pool.send("target_trigger_capture", params,
+                              alias=alias, read_timeout=read_timeout)
         except (ConnectionError, KeyError) as e:
             return {"ok": False, "error": str(e)}
 

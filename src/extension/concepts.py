@@ -241,6 +241,53 @@ imports before they hit a 60s replay timeout.
 """,
     },
 
+    # --- Capture triggering ---
+    {
+        "name"      : "concept:trigger_capture_from_target",
+        "kind"      : "concept",
+        "signature" : "Instance(action=targets) → Instance(action=trigger_capture)",
+        "doc"       : """\
+Two-step "make a fresh capture from a running game" workflow:
+
+  1. List live capture-layer targets:
+
+        Instance(action="targets")
+        # -> {'targets': [
+        #       {'ident': 38920, 'target': 'SkyrimSE.exe',
+        #        'pid': 12480, 'api': 'D3D11'},
+        #     ]}
+
+  2. Trigger one or more frame captures on a target:
+
+        Instance(action="trigger_capture", target_ident=38920,
+                 num_frames=1, directory="C:/captures/run1/")
+        # -> {'captures': [
+        #       {'captureId': 0, 'frameNumber': 12345,
+        #        'target_path': 'C:/Users/.../SkyrimSE_2026...rdc',
+        #        'local_path':  'C:/captures/run1/SkyrimSE_...rdc',
+        #        'byteSize': 268435456}],
+        #     'complete': True}
+
+Use ``num_frames=N`` for sequential multi-frame; each lands as its
+own .rdc. Use ``frame_number=N`` to QueueCapture starting at frame N
+instead of "next frame". Pass ``directory=`` to also CopyCapture each
+arrival to a local folder; omit it to leave the file on the target.
+
+``wait_secs`` (default 10, max 300) is how long the handler blocks
+waiting for captures to arrive. For long multi-frame waits, fire
+async — wrap the call in Eval(async_mode=True) and poll Task —
+because the handler holds the bridge lock for its full duration.
+
+After a capture lands, hand the local_path (or the target_path if
+the file is shared) to Instance(action="open", file=...) to spawn a
+headless worker for analysis, or to Instance(action="load_capture",
+file=..., alias=...) to load it into the GUI.
+
+Pass ``force=True`` to steal the target-control channel from any
+RenderDoc UI that's currently attached to the target.
+""",
+    },
+
     # --- Pixel debugging ---
     {
         "name"      : "concept:pixel_debugger_workflow",
