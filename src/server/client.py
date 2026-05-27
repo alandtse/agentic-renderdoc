@@ -480,10 +480,21 @@ def _enrich_instance(sock: socket.socket, instance: dict) -> dict:
 
 def _first_free_port(port_range: range,
                      exclude: Optional[set] = None) -> Optional[int]:
-    """First locally-bindable port in range, skipping exclude. None if all taken."""
+    """First locally-bindable port in range, skipping exclude. None if all taken.
+
+    A bind probe with SO_REUSEADDR is not enough on Windows: the
+    extension's bridge listener also sets SO_REUSEADDR (upstream
+    ``bridge.py``), so two listeners can coexist on the same port and
+    bind() would silently succeed against a port that already has a
+    running bridge. Connect-probe first to detect a live bridge.
+    """
     excl = exclude or set()
     for port in port_range:
         if port in excl:
+            continue
+        if _probe_port(port) is not None:
+            # Something is already listening — could be a GUI bridge on
+            # the same port we'd otherwise hijack via SO_REUSEADDR.
             continue
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
