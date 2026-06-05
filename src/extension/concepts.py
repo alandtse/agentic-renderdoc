@@ -288,6 +288,39 @@ RenderDoc UI that's currently attached to the target.
 """,
     },
 
+    # --- Large captures ---
+    {
+        "name"      : "concept:large_capture_workflow",
+        "kind"      : "concept",
+        "signature" : "GUI load_capture + Eval(async_mode) + Task(poll)",
+        "doc"       : """\
+Multi-GB captures (e.g. a single ~5GB stereo VR frame) wedge the
+headless worker: a SetFrameEvent to a late event replays the whole
+frame and outruns the socket deadline. Use the persistent GUI path:
+
+  1. Load into a GUI instance (no replay cutoff):
+
+        Instance(action="load_capture", file="C:/caps/vr.rdc", alias="vr")
+        # poll until ready:
+        Instance(action="list")   # wait for capture_loaded: true
+
+  2. Run slow queries as background tasks so they can't trip the
+     socket deadline:
+
+        Eval(code="describe_draw(eventId=8000)", instance="vr",
+             async_mode=True, timeout=600)
+        Task(action="poll", task_id=...)
+
+  3. Order SetFrameEvent calls by INCREASING eventId across calls so
+     replay steps forward incrementally instead of re-replaying the
+     frame from event 0 each time.
+
+Instance(action="open") (headless) is the wrong first choice here and
+returns a ``warning`` when handed a multi-GB file. Note: raw
+ctx.ctx.LoadCapture from Eval is blocked — use Instance(load_capture).
+""",
+    },
+
     # --- Pixel debugging ---
     {
         "name"      : "concept:pixel_debugger_workflow",
