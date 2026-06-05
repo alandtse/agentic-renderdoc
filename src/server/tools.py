@@ -73,6 +73,38 @@ def _start_task(cmd: str, params: dict, alias: str | None,
     return task_id
 
 
+def _start_callable_task(fn, alias: str | None = None) -> str:
+    """Register a task backed by an arbitrary callable, return the task_id.
+
+    Unlike _start_task (one pool send), this backgrounds any Python
+    callable — used for multi-send orchestrations like
+    find_first_divergence. Task(action='poll') collects fn()'s return
+    value or exception, identical to Eval(async_mode=True).
+    """
+    task_id = _make_task_id()
+
+    with _tasks_lock:
+        _tasks[task_id] = {
+            "status"     : "pending",
+            "started_at" : time.monotonic(),
+            "alias"      : alias,
+        }
+
+    def _runner() -> None:
+        try:
+            result = fn()
+            with _tasks_lock:
+                _tasks[task_id]["status"] = "done"
+                _tasks[task_id]["result"] = result
+        except Exception as e:
+            with _tasks_lock:
+                _tasks[task_id]["status"] = "error"
+                _tasks[task_id]["error"]  = str(e)
+
+    threading.Thread(target=_runner, daemon=True).start()
+    return task_id
+
+
 # Default capture-dump locations scanned by Instance(action='discover').
 # Override via AGENTIC_RENDERDOC_CAPTURE_DIRS (os.pathsep-separated).
 _DEFAULT_CAPTURE_DIRS_LINUX  = ["/tmp/RenderDoc"]
@@ -1268,6 +1300,8 @@ def instance(
     frame_number       : int | None = None,
     wait_secs          : float      = 10.0,
     host               : str | None = None,
+    async_mode         : bool       = False,
+    timeout            : float | None = None,
 ) -> Any:
     """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
@@ -1335,8 +1369,11 @@ def instance(
                                  and ``instance_b``; ``eid_start``/
                                  ``eid_end`` optionally clamp the
                                  search range. Long-running for large
-                                 captures — combine with async via the
-                                 Task tool.
+                                 captures: pass ``async_mode=True`` to run
+                                 it in the background (returns a task_id;
+                                 poll with the Task tool), and ``timeout=``
+                                 to set the per-step replay deadline
+                                 (default 120s).
              - ``targets``     : Enumerate running processes that have
                                  the RenderDoc capture layer loaded
                                  (e.g. skyrim.exe, the editor, …).
@@ -1385,6 +1422,11 @@ def instance(
                 under the SAME alias and the pool rebinds the name to it,
                 so Eval(instance="vr") keeps working
                 (see concept:stable_connection_aliases).
+    async_mode: find_first_divergence only — run the bisection in the
+                background and return a task_id to poll via the Task tool.
+    timeout   : find_first_divergence only — per-step replay deadline in
+                seconds (default 120). Raise it for multi-GB captures
+                where each SetFrameEvent is slow.
 
     Capture discovery directories for ``discover`` default to
     ``/tmp/RenderDoc`` (Linux) or ``%TEMP%\\RenderDoc`` (Windows). Add
@@ -1491,9 +1533,23 @@ def instance(
                 "ok"    : False,
                 "error" : "find_first_divergence requires instance_a= and instance_b=",
             }
+        step_timeout = timeout if timeout is not None else 120.0
+        if async_mode:
+            # Each bisection step is a SetFrameEvent per instance; on a
+            # large capture the whole walk can run for minutes. Background
+            # it so the MCP call returns immediately and the agent polls.
+            try:
+                task_id = _start_callable_task(
+                    lambda: _find_first_divergence(
+                        instance_a, instance_b, eid_start, eid_end, step_timeout),
+                    alias=instance_a,
+                )
+                return {"task_id": task_id, "status": "pending"}
+            except (ConnectionError, KeyError) as e:
+                return {"ok": False, "error": str(e)}
         try:
             return _find_first_divergence(
-                instance_a, instance_b, eid_start, eid_end,
+                instance_a, instance_b, eid_start, eid_end, step_timeout,
             )
         except (ConnectionError, KeyError) as e:
             return {"ok": False, "error": str(e)}
@@ -1550,10 +1606,11 @@ def instance(
     return {"ok": False, "error": f"unknown action: {action}"}
 
 
-def _find_first_divergence(instance_a: str,
-                           instance_b: str,
-                           eid_start : int | None,
-                           eid_end   : int | None) -> dict:
+def _find_first_divergence(instance_a   : str,
+                           instance_b   : str,
+                           eid_start    : int | None,
+                           eid_end      : int | None,
+                           step_timeout : float = 120.0) -> dict:
     """Bisect events between two pool aliases, return first divergence.
 
     Strategy:
@@ -1584,6 +1641,7 @@ def _find_first_divergence(instance_a: str,
         "eval",
         {"code": "get_draw_calls()"},
         alias=instance_a,
+        read_timeout=step_timeout,
     )
     if not draws_resp.get("ok"):
         return {"ok": False, "error": "could not list draws from {!r}: {}".format(
@@ -1608,7 +1666,7 @@ def _find_first_divergence(instance_a: str,
             "eval",
             {"code": "describe_draws([{}])".format(eid)},
             alias=alias,
-            read_timeout=120.0,
+            read_timeout=step_timeout,
         )
         if not resp.get("ok"):
             return None
