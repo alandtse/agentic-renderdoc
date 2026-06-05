@@ -298,9 +298,14 @@ def pipeline_state(state: rd.PipeState) -> dict:
             }
         else:
             result["depth_target"] = None
-    except Exception:
-        result["render_targets"] = []
-        result["depth_target"]   = None
+    except Exception as e:
+        # Record the failure instead of swallowing it: an empty
+        # render_targets must mean "none bound", not "the query raised and
+        # we hid it" (the same trap fixed in describe_draw/get_outputs).
+        # Other sections below already report errors this way.
+        result["render_targets"]       = []
+        result["depth_target"]         = None
+        result["output_targets_error"] = str(e)
 
     # Viewport (GetViewport returns a single viewport for the given index).
     try:
