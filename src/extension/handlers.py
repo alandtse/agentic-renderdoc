@@ -77,8 +77,11 @@ def handle_eval(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         # Silent-null trap: code ended with `foo = ...` (not a bare
         # expression) and bound no `result`/`_` sentinel, so nothing came
         # back. Point the agent at the return convention instead of leaving
-        # them to guess why data is null.
-        if raw_result is None and _last_node_is_assignment(code):
+        # them to guess why data is null. Skip the hint when a `result`/`_`
+        # sentinel IS bound — a deliberate `result = None` used the
+        # convention correctly and shouldn't be told it didn't.
+        if (raw_result is None and _last_node_is_assignment(code)
+                and "result" not in namespace and "_" not in namespace):
             response["hint"] = (
                 "Eval returns the last expression (or a `result`/`_` "
                 "variable). Your final statement is an assignment, so the "
