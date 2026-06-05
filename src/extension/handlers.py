@@ -2,6 +2,7 @@
 
 Handlers: eval, api_index, instance_info, get_texture, reload, shutdown.
 """
+import ast
 import traceback
 from typing import Any, Callable, Dict, List, Optional
 
@@ -73,6 +74,20 @@ def handle_eval(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         result     = _serialize_result(raw_result)
 
         response = {"ok": True, "data": result}
+        # Silent-null trap: code ended with `foo = ...` (not a bare
+        # expression) and bound no `result`/`_` sentinel, so nothing came
+        # back. Point the agent at the return convention instead of leaving
+        # them to guess why data is null. Skip the hint when a `result`/`_`
+        # sentinel IS bound — a deliberate `result = None` used the
+        # convention correctly and shouldn't be told it didn't.
+        if (raw_result is None and _last_node_is_assignment(code)
+                and "result" not in namespace and "_" not in namespace):
+            response["hint"] = (
+                "Eval returns the last expression (or a `result`/`_` "
+                "variable). Your final statement is an assignment, so the "
+                "result is null — end with a bare expression (e.g. `result`) "
+                "or assign to `result`."
+            )
         if captured_output:
             response["output"] = captured_output
         if ctx._replay_warnings:
@@ -1134,7 +1149,12 @@ def _exec_with_result(code: str, namespace: Dict[str, Any]) -> Any:
 
     Splits the code into statements and the final expression. Executes all
     statements, then evaluates the final expression and returns its value.
-    If the final line is not an expression, returns None.
+
+    If the final line is NOT an expression (e.g. ``result = {...}``), the
+    last-expression channel yields nothing, so we honor the ``result`` /
+    ``_`` convention: whichever of those names the code bound is returned.
+    This makes both the "end with a bare expression" and "assign ``result``"
+    patterns work. If neither is bound, returns None.
     """
     import ast
 
@@ -1153,7 +1173,34 @@ def _exec_with_result(code: str, namespace: Dict[str, Any]) -> Any:
         return eval(compile(expr, "<eval>", "eval"), namespace)
     else:
         exec(compile(tree, "<eval>", "exec"), namespace)
+        # Last statement isn't an expression. Fall back to the conventional
+        # sentinel names so `result = {...}` (a very natural final line) is
+        # returned instead of a silent null.
+        if "result" in namespace:
+            return namespace["result"]
+        if "_" in namespace:
+            return namespace["_"]
         return None
+
+
+# AST node types whose presence as the final statement means the code ended
+# with an assignment rather than a value-producing expression.
+_ASSIGN_NODES = (ast.Assign, ast.AugAssign, ast.AnnAssign)
+
+
+def _last_node_is_assignment(code: str) -> bool:
+    """True if the final top-level statement is an assignment.
+
+    Used to attach a helpful hint when Eval returns None: the most common
+    cause is ending the block with ``result = ...`` and expecting it back.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    return bool(tree.body) and isinstance(tree.body[-1], _ASSIGN_NODES)
 
 
 def _format_error(exc: Exception, code: str, namespace: Dict[str, Any]) -> Dict[str, Any]:
