@@ -38,11 +38,15 @@ def _make_task_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def _run_async(task_id: str, cmd: str, params: dict, alias: str | None,
-               timeout: float) -> None:
-    """Worker target: run a pool command and store the result in _tasks."""
+def _run_task_body(task_id: str, thunk) -> None:
+    """Daemon-thread body: run thunk(), record its result or exception.
+
+    The single place the task registry transitions pending -> done/error,
+    shared by every task flavor (single pool send, multi-send
+    orchestration, …).
+    """
     try:
-        result = _pool.send(cmd, params, alias=alias, read_timeout=timeout)
+        result = thunk()
         with _tasks_lock:
             _tasks[task_id]["status"] = "done"
             _tasks[task_id]["result"] = result
@@ -52,34 +56,13 @@ def _run_async(task_id: str, cmd: str, params: dict, alias: str | None,
             _tasks[task_id]["error"]  = str(e)
 
 
-def _start_task(cmd: str, params: dict, alias: str | None,
-                timeout: float = 300.0) -> str:
-    """Register a task, fire it on a daemon thread, return the task_id."""
-    task_id = _make_task_id()
-
-    with _tasks_lock:
-        _tasks[task_id] = {
-            "status"     : "pending",
-            "started_at" : time.monotonic(),
-            "alias"      : alias,
-        }
-
-    t = threading.Thread(
-        target = _run_async,
-        args   = (task_id, cmd, params, alias, timeout),
-        daemon = True,
-    )
-    t.start()
-    return task_id
-
-
 def _start_callable_task(fn, alias: str | None = None) -> str:
     """Register a task backed by an arbitrary callable, return the task_id.
 
-    Unlike _start_task (one pool send), this backgrounds any Python
-    callable — used for multi-send orchestrations like
-    find_first_divergence. Task(action='poll') collects fn()'s return
-    value or exception, identical to Eval(async_mode=True).
+    Backgrounds any Python callable — a single pool send (see
+    _start_task) or a multi-send orchestration like find_first_divergence.
+    Task(action='poll') collects fn()'s return value or exception,
+    identical to Eval(async_mode=True).
     """
     task_id = _make_task_id()
 
@@ -90,19 +73,20 @@ def _start_callable_task(fn, alias: str | None = None) -> str:
             "alias"      : alias,
         }
 
-    def _runner() -> None:
-        try:
-            result = fn()
-            with _tasks_lock:
-                _tasks[task_id]["status"] = "done"
-                _tasks[task_id]["result"] = result
-        except Exception as e:
-            with _tasks_lock:
-                _tasks[task_id]["status"] = "error"
-                _tasks[task_id]["error"]  = str(e)
-
-    threading.Thread(target=_runner, daemon=True).start()
+    threading.Thread(
+        target = lambda: _run_task_body(task_id, fn),
+        daemon = True,
+    ).start()
     return task_id
+
+
+def _start_task(cmd: str, params: dict, alias: str | None,
+                timeout: float = 300.0) -> str:
+    """Register a single-pool-send task, fire it, return the task_id."""
+    return _start_callable_task(
+        lambda: _pool.send(cmd, params, alias=alias, read_timeout=timeout),
+        alias=alias,
+    )
 
 
 # Default capture-dump locations scanned by Instance(action='discover').
