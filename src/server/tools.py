@@ -1718,5 +1718,3 @@ def _captured_program(filename: str) -> str | None:
     if m is None:
         return None
     return m.group("exe")
-
-
