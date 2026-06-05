@@ -517,6 +517,15 @@ def eval(code: str, instance: str | None = None,
             Viewport rect at an event as a plain dict (x, y, width,
             height, minDepth, maxDepth).
 
+        depth_stencil(eventId=None)
+            Depth/stencil TEST state (enable, write, compare func,
+            stencil ops) — which is NOT on the API-agnostic PipeState.
+            Finds the API-specific object (D3D11/12
+            outputMerger.depthStencilState, Vulkan depthStencil) and
+            returns {"api", "depth_stencil": {...}} with the real field
+            names dumped, so you skip the GetD3D11PipelineState() vs
+            GetVulkanPipelineState() guess.
+
         usage(resource)
             Every event that used a resource, with the usage kind.
             Wraps GetUsage, which requires a ResourceId OBJECT — this

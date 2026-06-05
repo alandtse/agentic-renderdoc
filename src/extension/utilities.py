@@ -1960,6 +1960,132 @@ def make_get_viewport(ctx: Any) -> Callable[..., dict]:
     return get_viewport
 
 
+def _coerce_state_value(val: Any, depth: int) -> Any:
+    """Convert a pipeline-state attribute value to a JSON-friendly form.
+
+    Enums (RenderDoc enums subclass int but carry a str ``.name``) become
+    their name; primitives pass through; small nested structs recurse one
+    level; everything else falls back to str(). Defensive — never raises.
+    """
+    # Enum first: RenderDoc enums are int subclasses, so check .name before
+    # the int branch or we'd lose the readable name.
+    nm = getattr(val, "name", None)
+    if isinstance(nm, str) and not isinstance(val, str):
+        return nm
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if isinstance(val, (list, tuple)):
+        return [_coerce_state_value(v, depth - 1) for v in val][:32]
+    if depth > 0:
+        try:
+            return _dump_state_struct(val, depth - 1)
+        except Exception:
+            return str(val)
+    return str(val)
+
+
+def _dump_state_struct(obj: Any, depth: int = 1) -> dict:
+    """Shallow-dump a SWIG state struct's data attributes to a plain dict.
+
+    Reflects whatever fields the object actually exposes rather than
+    hardcoding API-specific names (which differ across D3D11/12/Vulkan/GL
+    and are a known round-trip trap). Methods and SWIG internals are
+    skipped; values go through _coerce_state_value.
+    """
+    out = {}
+    for name in dir(obj):
+        if name.startswith("_") or name in _SWIG_INTERNAL:
+            continue
+        try:
+            val = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(val):
+            continue
+        out[name] = _coerce_state_value(val, depth)
+    return out
+
+
+def make_depth_stencil(ctx: Any) -> Callable[..., dict]:
+    """Create a depth_stencil accessor bound to the given HandlerContext.
+
+    Depth/stencil TEST state (enable, write, compare func, stencil ops) is
+    NOT on the API-agnostic PipeState — it lives on the API-specific
+    object (D3D11/12 outputMerger.depthStencilState, Vulkan depthStencil).
+    This helper finds the right one and dumps it as a plain dict.
+    """
+    # (api, accessor name, function locating the DS struct on that state)
+    _ATTEMPTS = [
+        ("D3D11",  "GetD3D11PipelineState",
+         lambda s: getattr(getattr(s, "outputMerger", None), "depthStencilState", None)),
+        ("D3D12",  "GetD3D12PipelineState",
+         lambda s: getattr(getattr(s, "outputMerger", None), "depthStencilState", None)),
+        ("Vulkan", "GetVulkanPipelineState",
+         lambda s: getattr(s, "depthStencil", None)),
+    ]
+
+    def depth_stencil(eventId: Optional[int] = None,
+                      controller: Any = None) -> dict:
+        """Depth/stencil test state at an event as a plain dict.
+
+        eventId    -- Seek the replay cursor here first (omit for current).
+        controller -- Optional ReplayController if already inside replay.
+
+        Returns {event_id, api, depth_stencil: {...}} or a structured
+        error if no API-specific pipeline state could be located.
+        """
+        def _work(ctrl: Any) -> dict:
+            if eventId is not None:
+                ctrl.SetFrameEvent(int(eventId), True)
+
+            # Each GetXxxPipelineState() returns None unless the capture is
+            # that API, so the first non-None hit identifies the API.
+            for api, getter, ds_path in _ATTEMPTS:
+                fn = getattr(ctrl, getter, None)
+                if fn is None:
+                    continue
+                try:
+                    state = fn()
+                except Exception:
+                    state = None
+                if state is None:
+                    continue
+                ds_obj = ds_path(state)
+                if ds_obj is None:
+                    return {"event_id": eventId, "api": api,
+                            "depth_stencil": None,
+                            "note": "no depth-stencil state object on this pipeline"}
+                return {"event_id": eventId, "api": api,
+                        "depth_stencil": _dump_state_struct(ds_obj)}
+
+            # OpenGL (and anything else) — dump whatever depth/stencil
+            # sub-state the GL pipeline exposes, defensively.
+            gl = getattr(ctrl, "GetGLPipelineState", None)
+            if gl is not None:
+                try:
+                    s = gl()
+                except Exception:
+                    s = None
+                if s is not None:
+                    ds = {}
+                    for fld in ("depthState", "stencilState"):
+                        sub = getattr(s, fld, None)
+                        if sub is not None:
+                            ds[fld] = _dump_state_struct(sub)
+                    return {"event_id": eventId, "api": "OpenGL",
+                            "depth_stencil": ds or None}
+
+            return {
+                "ok"    : False,
+                "error" : "could not locate an API-specific pipeline state; "
+                          "use inspect(controller.GetPipelineState()) to explore",
+            }
+
+        return _run_replay(ctx, _work, controller)
+
+    return depth_stencil
+
+
 def make_usage(ctx: Any) -> Callable[..., dict]:
     """Create a usage accessor bound to the given HandlerContext.
 
@@ -2024,6 +2150,7 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "describe_draws"       : make_describe_draws(ctx),
         "get_outputs"          : make_get_outputs(ctx),
         "get_viewport"         : make_get_viewport(ctx),
+        "depth_stencil"        : make_depth_stencil(ctx),
         "usage"                : make_usage(ctx),
         "goto_event"           : make_goto_event(ctx),
         "view_texture"         : make_view_texture(ctx),
