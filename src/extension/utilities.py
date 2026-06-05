@@ -1984,11 +1984,19 @@ def _coerce_state_value(val: Any, depth: int) -> Any:
         return nm
     if val is None or isinstance(val, (bool, int, float, str)):
         return val
+    if rd is not None and isinstance(val, rd.ResourceId):
+        # Opaque handle — its only useful form is the serialized id, not a
+        # struct dump (which yields {} since it exposes no data attrs).
+        from . import serialize
+        return serialize.resource_id(val)
     if isinstance(val, (list, tuple)):
         return [_coerce_state_value(v, depth - 1) for v in val][:32]
     if depth > 0:
         try:
-            return _dump_state_struct(val, depth - 1)
+            dumped = _dump_state_struct(val, depth - 1)
+            # An opaque object dumps to {}; show its repr instead of a
+            # misleading empty struct.
+            return dumped if dumped else str(val)
         except Exception:
             return str(val)
     return str(val)
