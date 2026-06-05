@@ -646,17 +646,23 @@ class ConnectionPool:
     # --- Worker lifecycle (spawn + close) ---
 
     def open(self, capture_path: str,
-             alias: Optional[str] = None) -> dict:
+             alias: Optional[str] = None,
+             bind_wait: Optional[float] = None) -> dict:
         """Spawn a headless worker for a .rdc file and connect to it.
 
         capture_path -- Absolute path to the .rdc capture file.
         alias        -- Name to register under. Auto-derived from the
                         capture filename stem if omitted.
+        bind_wait    -- Seconds to wait for the worker to bind its bridge
+                        and finish loading the capture before giving up.
+                        Defaults to _WORKER_BIND_WAIT; raise it for large
+                        captures that load slowly in the worker.
 
         Returns the worker metadata (alias, port, remote_port, pid, info).
         Raises RuntimeError on any spawn failure; the subprocess is
         reaped if it was started.
         """
+        bind_wait = _WORKER_BIND_WAIT if bind_wait is None else bind_wait
         capture = Path(capture_path)
         if not capture.exists():
             raise RuntimeError("capture not found: {}".format(capture))
@@ -693,7 +699,7 @@ class ConnectionPool:
             capture.resolve(), bridge_port, remote_port,
         )
 
-        info = _wait_for_bridge(proc, bridge_port, timeout=_WORKER_BIND_WAIT)
+        info = _wait_for_bridge(proc, bridge_port, timeout=bind_wait)
         if info is None:
             _reap_proc(proc)
             err_bytes = b"".join(stderr_buffer)
@@ -723,7 +729,7 @@ class ConnectionPool:
                 label = "stderr"
             raise RuntimeError(
                 "headless worker did not bind on {} within {:.0f}s; "
-                "{}: {}".format(bridge_port, _WORKER_BIND_WAIT, label, diag)
+                "{}: {}".format(bridge_port, bind_wait, label, diag)
             )
 
         # Healthy — stop buffering stderr but keep the drain thread running.

@@ -1302,6 +1302,7 @@ def instance(
     host               : str | None = None,
     async_mode         : bool       = False,
     timeout            : float | None = None,
+    bind_wait          : float | None = None,
 ) -> Any:
     """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
@@ -1326,6 +1327,9 @@ def instance(
                                  multi-GB VR captures prefer load_capture
                                  into a GUI instead (the response carries
                                  a ``warning`` when the file is large).
+                                 Raise ``bind_wait`` if a large capture
+                                 needs more than the default 30s to load
+                                 in the worker before it binds.
              - ``disconnect``  : Drop the named connection. Does NOT kill
                                  the underlying instance.
              - ``close``       : Stop a headless worker we spawned and
@@ -1427,6 +1431,9 @@ def instance(
     timeout   : find_first_divergence only — per-step replay deadline in
                 seconds (default 120). Raise it for multi-GB captures
                 where each SetFrameEvent is slow.
+    bind_wait : open only — seconds to wait for the headless worker to
+                bind its bridge and finish loading the capture (default
+                30). Raise it for large captures that load slowly.
 
     Capture discovery directories for ``discover`` default to
     ``/tmp/RenderDoc`` (Linux) or ``%TEMP%\\RenderDoc`` (Windows). Add
@@ -1445,7 +1452,7 @@ def instance(
             return {"ok": False, "error": "file is required for open"}
         warning = _large_capture_warning(file)
         try:
-            spawn = _pool.open(file, alias=alias)
+            spawn = _pool.open(file, alias=alias, bind_wait=bind_wait)
         except RuntimeError as e:
             # The headless spawn is exactly what a multi-GB capture tends
             # to fail (bind/load timeout) — surface the warning here too so
