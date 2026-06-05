@@ -1332,7 +1332,14 @@ def instance(
         try:
             spawn = _pool.open(file, alias=alias)
         except RuntimeError as e:
-            return {"ok": False, "error": str(e)}
+            # The headless spawn is exactly what a multi-GB capture tends
+            # to fail (bind/load timeout) — surface the warning here too so
+            # the agent learns why and what to do instead, not just on the
+            # rare large-but-fast success.
+            err = {"ok": False, "error": str(e)}
+            if warning:
+                err["warning"] = warning
+            return err
         result = {"ok": True, **spawn}
         if warning:
             result["warning"] = warning
