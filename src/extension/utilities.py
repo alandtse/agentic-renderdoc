@@ -1316,6 +1316,12 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
     action = _find_action(ctrl.GetRootActions(), eventId)
     name   = action.GetName(structured_file) if action else None
 
+    # Record query failures instead of swallowing them: an empty
+    # render_targets/depth_target must mean "nothing bound", never "the
+    # query raised and we hid it" — otherwise a wrong-output diagnosis (or
+    # a find_first_divergence comparison) silently anchors on bad data.
+    errors = {}
+
     stages = [
         ("vs", rd.ShaderStage.Vertex),
         ("hs", rd.ShaderStage.Hull),
@@ -1335,16 +1341,16 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
         for rt in state.GetOutputTargets():
             if int(rt.resource) != 0:
                 render_targets.append(serialize.resource_id(rt.resource))
-    except Exception:
-        pass
+    except Exception as e:
+        errors["render_targets"] = "{}: {}".format(type(e).__name__, e)
 
     depth_target = None
     try:
         depth = state.GetDepthTarget()
         if depth and int(depth.resource) != 0:
             depth_target = serialize.resource_id(depth.resource)
-    except Exception:
-        pass
+    except Exception as e:
+        errors["depth_target"] = "{}: {}".format(type(e).__name__, e)
 
     draw_params = None
     if action and (action.flags & rd.ActionFlags.Drawcall):
@@ -1389,7 +1395,7 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
     except Exception:
         pass
 
-    return {
+    result = {
         "event_id"       : eventId,
         "name"           : name,
         "shaders"        : shaders,
@@ -1400,6 +1406,9 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
         "index_buffer"   : index_buffer,
         "push_constants" : push_constants,
     }
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def make_describe_draws(ctx: Any) -> Callable[..., List[dict]]:
@@ -1887,6 +1896,7 @@ def make_get_outputs(ctx: Any) -> Callable[..., dict]:
             if eventId is not None:
                 ctrl.SetFrameEvent(int(eventId), True)
             state = ctrl.GetPipelineState()
+            errors = {}
             color = []
             try:
                 for rt in state.GetOutputTargets():
@@ -1897,8 +1907,9 @@ def make_get_outputs(ctx: Any) -> Callable[..., dict]:
                             "firstMip"   : int(getattr(rt, "firstMip", 0)),
                             "firstSlice" : int(getattr(rt, "firstSlice", 0)),
                         })
-            except Exception:
-                pass
+            except Exception as e:
+                # Record, don't hide: empty color must mean "none bound".
+                errors["color"] = "{}: {}".format(type(e).__name__, e)
             depth = None
             try:
                 d = state.GetDepthTarget()
@@ -1907,9 +1918,12 @@ def make_get_outputs(ctx: Any) -> Callable[..., dict]:
                         "resource" : serialize.resource_id(d.resource),
                         "format"   : _format_name(d.format),
                     }
-            except Exception:
-                pass
-            return {"event_id": eventId, "color": color, "depth": depth}
+            except Exception as e:
+                errors["depth"] = "{}: {}".format(type(e).__name__, e)
+            out = {"event_id": eventId, "color": color, "depth": depth}
+            if errors:
+                out["errors"] = errors
+            return out
 
         return _run_replay(ctx, _work, controller)
 
