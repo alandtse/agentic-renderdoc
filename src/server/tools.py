@@ -587,8 +587,11 @@ def eval(code: str, instance: str | None = None,
 
     TIMEOUT AND CRASH RECOVERY
     ==========================
-    The MCP server enforces per-command deadlines on every send. This
-    tool has a 90-second deadline (covers a full SetFrameEvent replay).
+    The MCP server enforces a per-command socket read deadline. For Eval
+    this deadline is the ``timeout`` argument (default 300s), in both
+    sync and async mode — enough for a full SetFrameEvent replay on most
+    frames. Raise it for multi-GB VR captures (see LARGE CAPTURES), or
+    lower it to surface a wedged worker sooner.
     On timeout, the response is::
 
         {"ok": false, "error": {
@@ -689,8 +692,10 @@ def eval(code: str, instance: str | None = None,
         # ... do other work ...
         Task(action="poll", task_id=t["task_id"])
 
-    timeout controls the socket read deadline for the background call
-    (default 300s). Ignored when async_mode=False.
+    timeout controls the socket read deadline for the call (default
+    300s) in BOTH sync and async mode. async_mode only decides whether
+    the call returns a task_id immediately (True) or blocks until the
+    result is ready (False).
 
     To fire work at two instances in parallel and collect both results:
 
@@ -698,6 +703,28 @@ def eval(code: str, instance: str | None = None,
         t2 = Eval(code="describe_draw(eventId=100)", instance="broken",   async_mode=True)
         Task(action="poll", task_id=t1["task_id"])
         Task(action="poll", task_id=t2["task_id"])
+
+    LARGE CAPTURES (multi-GB VR frames)
+    ===================================
+    Big captures (e.g. a single ~5GB stereo VR frame) need a different
+    workflow than the headless default — a SetFrameEvent to a late event
+    replays the whole frame and can outrun the socket deadline, wedging a
+    headless worker so it must be force-closed. The reliable path:
+
+      1. Load into a PERSISTENT GUI instance, which has no replay cutoff:
+             Instance(action="load_capture", file=..., alias="vr")
+         Poll Instance(action="list") until capture_loaded:true.
+      2. Run the slow query as a background task so it can't trip the
+         socket deadline:
+             Eval(code="describe_draw(eventId=...)", instance="vr",
+                  async_mode=True, timeout=600)
+             Task(action="poll", task_id=...)
+      3. Order SetFrameEvent calls by INCREASING eventId across calls so
+         replay steps forward incrementally instead of re-replaying the
+         whole frame from scratch each time.
+
+    Instance(action="open") (headless worker) is the wrong first choice
+    for such files — it warns when handed a multi-GB capture.
     """
     if not _pool.aliases:
         try:
@@ -717,7 +744,11 @@ def eval(code: str, instance: str | None = None,
         except (ConnectionError, KeyError) as e:
             return {"ok": False, "error": str(e)}
 
-    return _pool.send("eval", params, alias=instance)
+    # Synchronous path also honors `timeout` as the socket read deadline.
+    # The default (300s) is generous enough for a SetFrameEvent on a large
+    # frame; raise it further for multi-GB VR captures, or lower it if you
+    # want a wedged worker surfaced sooner.
+    return _pool.send("eval", params, alias=instance, read_timeout=timeout)
 
 
 # --- search_api ---
@@ -1119,6 +1150,37 @@ def _decode_texture(raw: bytes, width: int, height: int, fmt: dict, black_point:
 
 # --- instance ---
 
+# Headless workers replay under a bounded socket deadline; a single
+# SetFrameEvent on a multi-GB frame can exceed it. At or above this size the
+# persistent-GUI load_capture + Eval(async_mode) path is far more reliable.
+_LARGE_CAPTURE_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
+
+
+def _large_capture_warning(path: str) -> str | None:
+    """Return guidance if `path` is large enough to wedge a headless worker.
+
+    Non-fatal: Instance(action='open') still proceeds. Returns None when the
+    file is small or its size can't be determined.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    if size < _LARGE_CAPTURE_BYTES:
+        return None
+    gib = size / (1024 ** 3)
+    return (
+        f"{os.path.basename(path)} is {gib:.1f} GiB. Headless replay runs "
+        "under a bounded socket deadline, and a single SetFrameEvent on a "
+        "frame this large can exceed it (the worker wedges and must be "
+        "force-closed). Prefer loading into a persistent GUI instance — "
+        "Instance(action='load_capture', file=..., alias=...) — then query "
+        "with Eval(async_mode=True, timeout=600) + Task(action='poll'), "
+        "ordering SetFrameEvent calls by increasing eventId. See the Eval "
+        "tool's LARGE CAPTURES section."
+    )
+
+
 @mcp.tool(name="Instance")
 def instance(
     action             : str,
@@ -1158,7 +1220,11 @@ def instance(
                                  from the capture filename if omitted).
              - ``open``        : Spawn a headless worker for ``file`` via
                                  ``renderdoccmd remoteserver``, register
-                                 it under ``alias``.
+                                 it under ``alias``. Headless replay runs
+                                 under a bounded socket deadline; for
+                                 multi-GB VR captures prefer load_capture
+                                 into a GUI instead (the response carries
+                                 a ``warning`` when the file is large).
              - ``disconnect``  : Drop the named connection. Does NOT kill
                                  the underlying instance.
              - ``close``       : Stop a headless worker we spawned and
@@ -1184,7 +1250,12 @@ def instance(
                                  call ctx.ctx.LoadCapture from Eval (it
                                  deadlocks the replay thread). Pass
                                  ``force=True`` to close any currently
-                                 loaded capture first.
+                                 loaded capture first. The persistent GUI
+                                 has no replay cutoff, so this is the
+                                 preferred path for multi-GB VR captures —
+                                 pair with Eval(async_mode=True). Poll
+                                 Instance(action="list") until
+                                 capture_loaded:true before querying.
              - ``close_capture``: Close the currently loaded capture in
                                  a GUI instance (Qt-UI-thread safe).
              - ``find_first_divergence``:
@@ -1257,11 +1328,22 @@ def instance(
     if action == "open":
         if not file:
             return {"ok": False, "error": "file is required for open"}
+        warning = _large_capture_warning(file)
         try:
             spawn = _pool.open(file, alias=alias)
         except RuntimeError as e:
-            return {"ok": False, "error": str(e)}
-        return {"ok": True, **spawn}
+            # The headless spawn is exactly what a multi-GB capture tends
+            # to fail (bind/load timeout) — surface the warning here too so
+            # the agent learns why and what to do instead, not just on the
+            # rare large-but-fast success.
+            err = {"ok": False, "error": str(e)}
+            if warning:
+                err["warning"] = warning
+            return err
+        result = {"ok": True, **spawn}
+        if warning:
+            result["warning"] = warning
+        return result
 
     if action == "connect":
         if port is None:
