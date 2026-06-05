@@ -491,6 +491,12 @@ def eval(code: str, instance: str | None = None,
     =================
     - The last expression in your code block is captured and returned as
       the result. You do not need to assign it or call return.
+    - TRAP: if your final line is an ASSIGNMENT (e.g. `result = {...}`),
+      that is a statement, not an expression — so the last-expression
+      channel is empty and the result is null. Either end with a bare
+      expression (`result` on its own line) or assign to the name
+      `result` (or `_`), both of which are returned. Any other final
+      assignment yields null and the response carries a `hint` saying so.
     - Return dicts or lists for structured data.
     - print() output is also captured and included in the response.
     - ctx.replay(callback) returns the callback's return value directly:
