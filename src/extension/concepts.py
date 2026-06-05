@@ -434,6 +434,30 @@ summarize_texture, or usage().
 """,
     },
 
+    {
+        "name"      : "concept:depth_stencil_state",
+        "kind"      : "concept",
+        "signature" : "depth_stencil(eventId)",
+        "doc"       : """\
+"Is depth test/write on? What's the compare func and stencil op?"
+
+Depth/stencil TEST state is NOT on the API-agnostic PipeState — it
+lives on the API-specific object. Skip the guess:
+
+    depth_stencil(eventId=412)
+    # -> {'event_id': 412, 'api': 'D3D11',
+    #     'depth_stencil': {'depthEnable': True, 'depthWrites': False,
+    #                       'depthFunction': 'GreaterEqual',
+    #                       'stencilEnable': False,
+    #                       'frontFace': {...}, 'backFace': {...}}}
+
+Finds the right per-API object for you
+(D3D11/D3D12 outputMerger.depthStencilState, Vulkan depthStencil) and
+dumps its real fields. Raw path if you need it:
+controller.GetD3D11PipelineState().outputMerger.depthStencilState.
+""",
+    },
+
     # --- Fresh captures ---
     {
         "name"      : "concept:capture_completion_signal",

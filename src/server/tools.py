@@ -38,11 +38,15 @@ def _make_task_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-def _run_async(task_id: str, cmd: str, params: dict, alias: str | None,
-               timeout: float) -> None:
-    """Worker target: run a pool command and store the result in _tasks."""
+def _run_task_body(task_id: str, thunk) -> None:
+    """Daemon-thread body: run thunk(), record its result or exception.
+
+    The single place the task registry transitions pending -> done/error,
+    shared by every task flavor (single pool send, multi-send
+    orchestration, …).
+    """
     try:
-        result = _pool.send(cmd, params, alias=alias, read_timeout=timeout)
+        result = thunk()
         with _tasks_lock:
             _tasks[task_id]["status"] = "done"
             _tasks[task_id]["result"] = result
@@ -52,9 +56,14 @@ def _run_async(task_id: str, cmd: str, params: dict, alias: str | None,
             _tasks[task_id]["error"]  = str(e)
 
 
-def _start_task(cmd: str, params: dict, alias: str | None,
-                timeout: float = 300.0) -> str:
-    """Register a task, fire it on a daemon thread, return the task_id."""
+def _start_callable_task(fn, alias: str | None = None) -> str:
+    """Register a task backed by an arbitrary callable, return the task_id.
+
+    Backgrounds any Python callable — a single pool send (see
+    _start_task) or a multi-send orchestration like find_first_divergence.
+    Task(action='poll') collects fn()'s return value or exception,
+    identical to Eval(async_mode=True).
+    """
     task_id = _make_task_id()
 
     with _tasks_lock:
@@ -64,13 +73,20 @@ def _start_task(cmd: str, params: dict, alias: str | None,
             "alias"      : alias,
         }
 
-    t = threading.Thread(
-        target = _run_async,
-        args   = (task_id, cmd, params, alias, timeout),
+    threading.Thread(
+        target = lambda: _run_task_body(task_id, fn),
         daemon = True,
-    )
-    t.start()
+    ).start()
     return task_id
+
+
+def _start_task(cmd: str, params: dict, alias: str | None,
+                timeout: float = 300.0) -> str:
+    """Register a single-pool-send task, fire it, return the task_id."""
+    return _start_callable_task(
+        lambda: _pool.send(cmd, params, alias=alias, read_timeout=timeout),
+        alias=alias,
+    )
 
 
 # Default capture-dump locations scanned by Instance(action='discover').
@@ -485,6 +501,15 @@ def eval(code: str, instance: str | None = None,
             Viewport rect at an event as a plain dict (x, y, width,
             height, minDepth, maxDepth).
 
+        depth_stencil(eventId=None)
+            Depth/stencil TEST state (enable, write, compare func,
+            stencil ops) — which is NOT on the API-agnostic PipeState.
+            Finds the API-specific object (D3D11/12
+            outputMerger.depthStencilState, Vulkan depthStencil) and
+            returns {"api", "depth_stencil": {...}} with the real field
+            names dumped, so you skip the GetD3D11PipelineState() vs
+            GetVulkanPipelineState() guess.
+
         usage(resource)
             Every event that used a resource, with the usage kind.
             Wraps GetUsage, which requires a ResourceId OBJECT — this
@@ -819,6 +844,7 @@ def get_texture(
     compare_event_id : int | None = None,
     compare_instance : str | None = None,
     diff_amplify     : float = 4.0,
+    timeout          : float = 300.0,
 ) -> list:
     """Capture a texture or render target as a viewable image.
 
@@ -884,6 +910,13 @@ def get_texture(
                       differences become visible. Set 1.0 for no
                       amplification, or 0 to disable the diff image
                       (stats still computed).
+    timeout:          Socket read deadline in seconds (default 300).
+                      When event_id is set this drives a SetFrameEvent —
+                      a full frame replay — so raise it for render targets
+                      in large (multi-GB VR) captures, exactly as you
+                      would for Eval. Below the deadline the worker wedges
+                      and must be force-closed (see the Eval tool's
+                      TIMEOUT AND CRASH RECOVERY / LARGE CAPTURES).
     """
     if not _pool.aliases:
         try:
@@ -895,7 +928,7 @@ def get_texture(
     img_a, meta_a, err = _fetch_and_decode_texture(
         resource_id, event_id, mip, slice, sample, max_size,
         region_x, region_y, region_w, region_h,
-        channel, black_point, white_point, instance,
+        channel, black_point, white_point, instance, timeout,
     )
     if err is not None:
         return [TextContent(type="text", text=json.dumps(err))]
@@ -915,7 +948,7 @@ def get_texture(
         mip, slice, sample, max_size,
         region_x, region_y, region_w, region_h,
         channel, black_point, white_point,
-        compare_instance if compare_instance is not None else instance,
+        compare_instance if compare_instance is not None else instance, timeout,
     )
     if err is not None:
         return [TextContent(type="text", text=json.dumps(err))]
@@ -948,10 +981,45 @@ def get_texture(
     return blocks
 
 
+def _annotate_channel_extrema(img, metadata) -> None:
+    """Attach per-channel (min,max) of the LDR preview to metadata.
+
+    Adds metadata["channel_extrema"] = {band: {"min", "max"}, ...}. If any
+    band is uniformly zero, also adds metadata["all_zero_channels"] and a
+    metadata["hint"] pointing at summarize_texture for raw per-channel
+    stats — so a preview that renders black for a dead-channel reason is
+    self-flagging rather than silently misleading.
+    """
+    try:
+        extrema = img.getextrema()
+    except Exception:
+        return
+    bands = list(img.getbands())
+    # getextrema() returns (min,max) for single-band, or a tuple per band.
+    if not isinstance(extrema[0], tuple):
+        extrema = (extrema,)
+    ch = {}
+    zero = []
+    for band, pair in zip(bands, extrema):
+        lo, hi = pair[0], pair[1]
+        ch[band] = {"min": lo, "max": hi}
+        if hi == 0:
+            zero.append(band)
+    metadata["channel_extrema"] = ch
+    if zero:
+        metadata["all_zero_channels"] = zero
+        metadata["hint"] = (
+            "channel(s) {} are all-zero in the LDR preview, so the image "
+            "may look black/wrong for that reason alone. Use "
+            "summarize_texture(resource_id, event_id) for raw per-channel "
+            "min/max/NaN before concluding the render target is wrong."
+        ).format(zero)
+
+
 def _fetch_and_decode_texture(
     resource_id, event_id, mip, slice, sample, max_size,
     region_x, region_y, region_w, region_h,
-    channel, black_point, white_point, instance,
+    channel, black_point, white_point, instance, timeout=300.0,
 ):
     """Fetch a texture through the pool, decode + post-process to a Pillow Image.
 
@@ -964,7 +1032,7 @@ def _fetch_and_decode_texture(
         "mip"         : mip,
         "slice"       : slice,
         "sample"      : sample,
-    }, alias=instance)
+    }, alias=instance, read_timeout=timeout)
 
     if not resp.get("ok"):
         return None, None, resp
@@ -986,6 +1054,13 @@ def _fetch_and_decode_texture(
             "ok"    : False,
             "error" : f"unsupported texture format: {fmt_name}. use RenderDoc's texture viewer instead.",
         }
+
+    # Per-channel extrema of the LDR preview, computed before channel
+    # extraction collapses it to one band. Surfaces the "looks black but
+    # isn't" trap: a render target whose content sits only in G/B/A reads
+    # as solid black if you eyeball the R channel — flag the dead bands so
+    # a wrong-colour diagnosis isn't anchored on a misleading preview.
+    _annotate_channel_extrema(img, metadata)
 
     if channel >= 0:
         bands = img.split()
@@ -1218,6 +1293,9 @@ def instance(
     frame_number       : int | None = None,
     wait_secs          : float      = 10.0,
     host               : str | None = None,
+    async_mode         : bool       = False,
+    timeout            : float | None = None,
+    bind_wait          : float | None = None,
 ) -> Any:
     """Manage RenderDoc replay instances — both live GUIs and headless workers.
 
@@ -1242,6 +1320,9 @@ def instance(
                                  multi-GB VR captures prefer load_capture
                                  into a GUI instead (the response carries
                                  a ``warning`` when the file is large).
+                                 Raise ``bind_wait`` if a large capture
+                                 needs more than the default 30s to load
+                                 in the worker before it binds.
              - ``disconnect``  : Drop the named connection. Does NOT kill
                                  the underlying instance.
              - ``close``       : Stop a headless worker we spawned and
@@ -1285,8 +1366,11 @@ def instance(
                                  and ``instance_b``; ``eid_start``/
                                  ``eid_end`` optionally clamp the
                                  search range. Long-running for large
-                                 captures — combine with async via the
-                                 Task tool.
+                                 captures: pass ``async_mode=True`` to run
+                                 it in the background (returns a task_id;
+                                 poll with the Task tool), and ``timeout=``
+                                 to set the per-step replay deadline
+                                 (default 120s).
              - ``targets``     : Enumerate running processes that have
                                  the RenderDoc capture layer loaded
                                  (e.g. skyrim.exe, the editor, …).
@@ -1335,6 +1419,14 @@ def instance(
                 under the SAME alias and the pool rebinds the name to it,
                 so Eval(instance="vr") keeps working
                 (see concept:stable_connection_aliases).
+    async_mode: find_first_divergence only — run the bisection in the
+                background and return a task_id to poll via the Task tool.
+    timeout   : find_first_divergence only — per-step replay deadline in
+                seconds (default 120). Raise it for multi-GB captures
+                where each SetFrameEvent is slow.
+    bind_wait : open only — seconds to wait for the headless worker to
+                bind its bridge and finish loading the capture (default
+                30). Raise it for large captures that load slowly.
 
     Capture discovery directories for ``discover`` default to
     ``/tmp/RenderDoc`` (Linux) or ``%TEMP%\\RenderDoc`` (Windows). Add
@@ -1353,7 +1445,7 @@ def instance(
             return {"ok": False, "error": "file is required for open"}
         warning = _large_capture_warning(file)
         try:
-            spawn = _pool.open(file, alias=alias)
+            spawn = _pool.open(file, alias=alias, bind_wait=bind_wait)
         except RuntimeError as e:
             # The headless spawn is exactly what a multi-GB capture tends
             # to fail (bind/load timeout) — surface the warning here too so
@@ -1441,9 +1533,23 @@ def instance(
                 "ok"    : False,
                 "error" : "find_first_divergence requires instance_a= and instance_b=",
             }
+        step_timeout = timeout if timeout is not None else 120.0
+        if async_mode:
+            # Each bisection step is a SetFrameEvent per instance; on a
+            # large capture the whole walk can run for minutes. Background
+            # it so the MCP call returns immediately and the agent polls.
+            try:
+                task_id = _start_callable_task(
+                    lambda: _find_first_divergence(
+                        instance_a, instance_b, eid_start, eid_end, step_timeout),
+                    alias=instance_a,
+                )
+                return {"task_id": task_id, "status": "pending"}
+            except (ConnectionError, KeyError) as e:
+                return {"ok": False, "error": str(e)}
         try:
             return _find_first_divergence(
-                instance_a, instance_b, eid_start, eid_end,
+                instance_a, instance_b, eid_start, eid_end, step_timeout,
             )
         except (ConnectionError, KeyError) as e:
             return {"ok": False, "error": str(e)}
@@ -1500,10 +1606,11 @@ def instance(
     return {"ok": False, "error": f"unknown action: {action}"}
 
 
-def _find_first_divergence(instance_a: str,
-                           instance_b: str,
-                           eid_start : int | None,
-                           eid_end   : int | None) -> dict:
+def _find_first_divergence(instance_a   : str,
+                           instance_b   : str,
+                           eid_start    : int | None,
+                           eid_end      : int | None,
+                           step_timeout : float = 120.0) -> dict:
     """Bisect events between two pool aliases, return first divergence.
 
     Strategy:
@@ -1534,6 +1641,7 @@ def _find_first_divergence(instance_a: str,
         "eval",
         {"code": "get_draw_calls()"},
         alias=instance_a,
+        read_timeout=step_timeout,
     )
     if not draws_resp.get("ok"):
         return {"ok": False, "error": "could not list draws from {!r}: {}".format(
@@ -1558,7 +1666,7 @@ def _find_first_divergence(instance_a: str,
             "eval",
             {"code": "describe_draws([{}])".format(eid)},
             alias=alias,
-            read_timeout=120.0,
+            read_timeout=step_timeout,
         )
         if not resp.get("ok"):
             return None

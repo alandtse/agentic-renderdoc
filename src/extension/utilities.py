@@ -1316,6 +1316,12 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
     action = _find_action(ctrl.GetRootActions(), eventId)
     name   = action.GetName(structured_file) if action else None
 
+    # Record query failures instead of swallowing them: an empty
+    # render_targets/depth_target must mean "nothing bound", never "the
+    # query raised and we hid it" — otherwise a wrong-output diagnosis (or
+    # a find_first_divergence comparison) silently anchors on bad data.
+    errors = {}
+
     stages = [
         ("vs", rd.ShaderStage.Vertex),
         ("hs", rd.ShaderStage.Hull),
@@ -1335,16 +1341,16 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
         for rt in state.GetOutputTargets():
             if int(rt.resource) != 0:
                 render_targets.append(serialize.resource_id(rt.resource))
-    except Exception:
-        pass
+    except Exception as e:
+        errors["render_targets"] = _err_str(e)
 
     depth_target = None
     try:
         depth = state.GetDepthTarget()
         if depth and int(depth.resource) != 0:
             depth_target = serialize.resource_id(depth.resource)
-    except Exception:
-        pass
+    except Exception as e:
+        errors["depth_target"] = _err_str(e)
 
     draw_params = None
     if action and (action.flags & rd.ActionFlags.Drawcall):
@@ -1389,7 +1395,7 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
     except Exception:
         pass
 
-    return {
+    result = {
         "event_id"       : eventId,
         "name"           : name,
         "shaders"        : shaders,
@@ -1400,6 +1406,9 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
         "index_buffer"   : index_buffer,
         "push_constants" : push_constants,
     }
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 def make_describe_draws(ctx: Any) -> Callable[..., List[dict]]:
@@ -1801,6 +1810,16 @@ def make_highlight_drawcall(ctx: Any) -> Callable[..., dict]:
 
 # --- Convenience accessors (int-friendly, plain-dict returns) ---
 
+def _err_str(exc: Exception) -> str:
+    """Compact 'ExcType: message' rendering for the `errors` convention.
+
+    Helpers record query failures as {field: _err_str(exc)} so an empty
+    result is never confused with a failed one (see _describe_one /
+    get_outputs).
+    """
+    return "{}: {}".format(type(exc).__name__, exc)
+
+
 def _run_replay(ctx: Any, fn: Callable[[Any], Any], controller: Any) -> Any:
     """Run fn(controller) on the replay thread, reusing an active one.
 
@@ -1887,6 +1906,7 @@ def make_get_outputs(ctx: Any) -> Callable[..., dict]:
             if eventId is not None:
                 ctrl.SetFrameEvent(int(eventId), True)
             state = ctrl.GetPipelineState()
+            errors = {}
             color = []
             try:
                 for rt in state.GetOutputTargets():
@@ -1897,8 +1917,9 @@ def make_get_outputs(ctx: Any) -> Callable[..., dict]:
                             "firstMip"   : int(getattr(rt, "firstMip", 0)),
                             "firstSlice" : int(getattr(rt, "firstSlice", 0)),
                         })
-            except Exception:
-                pass
+            except Exception as e:
+                # Record, don't hide: empty color must mean "none bound".
+                errors["color"] = _err_str(e)
             depth = None
             try:
                 d = state.GetDepthTarget()
@@ -1907,9 +1928,12 @@ def make_get_outputs(ctx: Any) -> Callable[..., dict]:
                         "resource" : serialize.resource_id(d.resource),
                         "format"   : _format_name(d.format),
                     }
-            except Exception:
-                pass
-            return {"event_id": eventId, "color": color, "depth": depth}
+            except Exception as e:
+                errors["depth"] = _err_str(e)
+            out = {"event_id": eventId, "color": color, "depth": depth}
+            if errors:
+                out["errors"] = errors
+            return out
 
         return _run_replay(ctx, _work, controller)
 
@@ -1944,6 +1968,140 @@ def make_get_viewport(ctx: Any) -> Callable[..., dict]:
         return _run_replay(ctx, _work, controller)
 
     return get_viewport
+
+
+def _coerce_state_value(val: Any, depth: int) -> Any:
+    """Convert a pipeline-state attribute value to a JSON-friendly form.
+
+    Enums (RenderDoc enums subclass int but carry a str ``.name``) become
+    their name; primitives pass through; small nested structs recurse one
+    level; everything else falls back to str(). Defensive — never raises.
+    """
+    # Enum first: RenderDoc enums are int subclasses, so check .name before
+    # the int branch or we'd lose the readable name.
+    nm = getattr(val, "name", None)
+    if isinstance(nm, str) and not isinstance(val, str):
+        return nm
+    if val is None or isinstance(val, (bool, int, float, str)):
+        return val
+    if rd is not None and isinstance(val, rd.ResourceId):
+        # Opaque handle — its only useful form is the serialized id, not a
+        # struct dump (which yields {} since it exposes no data attrs).
+        from . import serialize
+        return serialize.resource_id(val)
+    if isinstance(val, (list, tuple)):
+        return [_coerce_state_value(v, depth - 1) for v in val][:32]
+    if depth > 0:
+        try:
+            dumped = _dump_state_struct(val, depth - 1)
+            # An opaque object dumps to {}; show its repr instead of a
+            # misleading empty struct.
+            return dumped if dumped else str(val)
+        except Exception:
+            return str(val)
+    return str(val)
+
+
+def _dump_state_struct(obj: Any, depth: int = 1) -> dict:
+    """Shallow-dump a SWIG state struct's data attributes to a plain dict.
+
+    Reflects whatever fields the object actually exposes rather than
+    hardcoding API-specific names (which differ across D3D11/12/Vulkan/GL
+    and are a known round-trip trap). Methods and SWIG internals are
+    skipped; values go through _coerce_state_value.
+    """
+    out = {}
+    for name in dir(obj):
+        if name.startswith("_") or name in _SWIG_INTERNAL:
+            continue
+        try:
+            val = getattr(obj, name)
+        except Exception:
+            continue
+        if callable(val):
+            continue
+        out[name] = _coerce_state_value(val, depth)
+    return out
+
+
+def make_depth_stencil(ctx: Any) -> Callable[..., dict]:
+    """Create a depth_stencil accessor bound to the given HandlerContext.
+
+    Depth/stencil TEST state (enable, write, compare func, stencil ops) is
+    NOT on the API-agnostic PipeState — it lives on the API-specific
+    object (D3D11/12 outputMerger.depthStencilState, Vulkan depthStencil).
+    This helper finds the right one and dumps it as a plain dict.
+    """
+    # (api, accessor name, function locating the DS struct on that state)
+    _ATTEMPTS = [
+        ("D3D11",  "GetD3D11PipelineState",
+         lambda s: getattr(getattr(s, "outputMerger", None), "depthStencilState", None)),
+        ("D3D12",  "GetD3D12PipelineState",
+         lambda s: getattr(getattr(s, "outputMerger", None), "depthStencilState", None)),
+        ("Vulkan", "GetVulkanPipelineState",
+         lambda s: getattr(s, "depthStencil", None)),
+    ]
+
+    def depth_stencil(eventId: Optional[int] = None,
+                      controller: Any = None) -> dict:
+        """Depth/stencil test state at an event as a plain dict.
+
+        eventId    -- Seek the replay cursor here first (omit for current).
+        controller -- Optional ReplayController if already inside replay.
+
+        Returns {event_id, api, depth_stencil: {...}} or a structured
+        error if no API-specific pipeline state could be located.
+        """
+        def _work(ctrl: Any) -> dict:
+            if eventId is not None:
+                ctrl.SetFrameEvent(int(eventId), True)
+
+            # Each GetXxxPipelineState() returns None unless the capture is
+            # that API, so the first non-None hit identifies the API.
+            for api, getter, ds_path in _ATTEMPTS:
+                fn = getattr(ctrl, getter, None)
+                if fn is None:
+                    continue
+                try:
+                    state = fn()
+                except Exception:
+                    state = None
+                if state is None:
+                    continue
+                ds_obj = ds_path(state)
+                if ds_obj is None:
+                    return {"event_id": eventId, "api": api,
+                            "depth_stencil": None,
+                            "note": "no depth-stencil state object on this pipeline"}
+                return {"event_id": eventId, "api": api,
+                        "depth_stencil": _dump_state_struct(ds_obj)}
+
+            # OpenGL (and anything else) — dump whatever depth/stencil
+            # sub-state the GL pipeline exposes, defensively.
+            gl = getattr(ctrl, "GetGLPipelineState", None)
+            if gl is not None:
+                try:
+                    s = gl()
+                except Exception:
+                    s = None
+                if s is not None:
+                    ds = {}
+                    for fld in ("depthState", "stencilState"):
+                        sub = getattr(s, fld, None)
+                        if sub is not None:
+                            ds[fld] = _dump_state_struct(sub)
+                    return {"event_id": eventId, "api": "OpenGL",
+                            "depth_stencil": ds or None}
+
+            return {
+                "ok"    : False,
+                "error" : "could not locate an API-specific pipeline state; "
+                          "use inspect(controller.GetPipelineState()) to explore",
+            }
+
+        return _run_replay(ctx, _work, controller)
+
+    return depth_stencil
 
 
 def make_usage(ctx: Any) -> Callable[..., dict]:
@@ -2010,6 +2168,7 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "describe_draws"       : make_describe_draws(ctx),
         "get_outputs"          : make_get_outputs(ctx),
         "get_viewport"         : make_get_viewport(ctx),
+        "depth_stencil"        : make_depth_stencil(ctx),
         "usage"                : make_usage(ctx),
         "goto_event"           : make_goto_event(ctx),
         "view_texture"         : make_view_texture(ctx),
