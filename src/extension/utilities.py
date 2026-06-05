@@ -1342,7 +1342,7 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
             if int(rt.resource) != 0:
                 render_targets.append(serialize.resource_id(rt.resource))
     except Exception as e:
-        errors["render_targets"] = "{}: {}".format(type(e).__name__, e)
+        errors["render_targets"] = _err_str(e)
 
     depth_target = None
     try:
@@ -1350,7 +1350,7 @@ def _describe_one(ctrl: Any, structured_file: Any, eventId: int) -> dict:
         if depth and int(depth.resource) != 0:
             depth_target = serialize.resource_id(depth.resource)
     except Exception as e:
-        errors["depth_target"] = "{}: {}".format(type(e).__name__, e)
+        errors["depth_target"] = _err_str(e)
 
     draw_params = None
     if action and (action.flags & rd.ActionFlags.Drawcall):
@@ -1810,6 +1810,16 @@ def make_highlight_drawcall(ctx: Any) -> Callable[..., dict]:
 
 # --- Convenience accessors (int-friendly, plain-dict returns) ---
 
+def _err_str(exc: Exception) -> str:
+    """Compact 'ExcType: message' rendering for the `errors` convention.
+
+    Helpers record query failures as {field: _err_str(exc)} so an empty
+    result is never confused with a failed one (see _describe_one /
+    get_outputs).
+    """
+    return "{}: {}".format(type(exc).__name__, exc)
+
+
 def _run_replay(ctx: Any, fn: Callable[[Any], Any], controller: Any) -> Any:
     """Run fn(controller) on the replay thread, reusing an active one.
 
@@ -1909,7 +1919,7 @@ def make_get_outputs(ctx: Any) -> Callable[..., dict]:
                         })
             except Exception as e:
                 # Record, don't hide: empty color must mean "none bound".
-                errors["color"] = "{}: {}".format(type(e).__name__, e)
+                errors["color"] = _err_str(e)
             depth = None
             try:
                 d = state.GetDepthTarget()
@@ -1919,7 +1929,7 @@ def make_get_outputs(ctx: Any) -> Callable[..., dict]:
                         "format"   : _format_name(d.format),
                     }
             except Exception as e:
-                errors["depth"] = "{}: {}".format(type(e).__name__, e)
+                errors["depth"] = _err_str(e)
             out = {"event_id": eventId, "color": color, "depth": depth}
             if errors:
                 out["errors"] = errors
