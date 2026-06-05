@@ -1,0 +1,18 @@
+# Minimal hygiene hooks so pre-commit.ci has a valid config to run.
+# Deliberately no code formatter/linter (ruff/black) yet: the codebase has
+# a deliberate alignment style that a formatter would churn — add those in a
+# separate, vetted pass.
+ci:
+  autofix_prs: true
+  autoupdate_schedule: monthly
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-toml
+      - id: check-added-large-files
+      - id: check-merge-conflict
