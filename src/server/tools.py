@@ -819,6 +819,7 @@ def get_texture(
     compare_event_id : int | None = None,
     compare_instance : str | None = None,
     diff_amplify     : float = 4.0,
+    timeout          : float = 300.0,
 ) -> list:
     """Capture a texture or render target as a viewable image.
 
@@ -884,6 +885,13 @@ def get_texture(
                       differences become visible. Set 1.0 for no
                       amplification, or 0 to disable the diff image
                       (stats still computed).
+    timeout:          Socket read deadline in seconds (default 300).
+                      When event_id is set this drives a SetFrameEvent —
+                      a full frame replay — so raise it for render targets
+                      in large (multi-GB VR) captures, exactly as you
+                      would for Eval. Below the deadline the worker wedges
+                      and must be force-closed (see the Eval tool's
+                      TIMEOUT AND CRASH RECOVERY / LARGE CAPTURES).
     """
     if not _pool.aliases:
         try:
@@ -895,7 +903,7 @@ def get_texture(
     img_a, meta_a, err = _fetch_and_decode_texture(
         resource_id, event_id, mip, slice, sample, max_size,
         region_x, region_y, region_w, region_h,
-        channel, black_point, white_point, instance,
+        channel, black_point, white_point, instance, timeout,
     )
     if err is not None:
         return [TextContent(type="text", text=json.dumps(err))]
@@ -915,7 +923,7 @@ def get_texture(
         mip, slice, sample, max_size,
         region_x, region_y, region_w, region_h,
         channel, black_point, white_point,
-        compare_instance if compare_instance is not None else instance,
+        compare_instance if compare_instance is not None else instance, timeout,
     )
     if err is not None:
         return [TextContent(type="text", text=json.dumps(err))]
@@ -948,10 +956,45 @@ def get_texture(
     return blocks
 
 
+def _annotate_channel_extrema(img, metadata) -> None:
+    """Attach per-channel (min,max) of the LDR preview to metadata.
+
+    Adds metadata["channel_extrema"] = {band: {"min", "max"}, ...}. If any
+    band is uniformly zero, also adds metadata["all_zero_channels"] and a
+    metadata["hint"] pointing at summarize_texture for raw per-channel
+    stats — so a preview that renders black for a dead-channel reason is
+    self-flagging rather than silently misleading.
+    """
+    try:
+        extrema = img.getextrema()
+    except Exception:
+        return
+    bands = list(img.getbands())
+    # getextrema() returns (min,max) for single-band, or a tuple per band.
+    if not isinstance(extrema[0], tuple):
+        extrema = (extrema,)
+    ch = {}
+    zero = []
+    for band, pair in zip(bands, extrema):
+        lo, hi = pair[0], pair[1]
+        ch[band] = {"min": lo, "max": hi}
+        if hi == 0:
+            zero.append(band)
+    metadata["channel_extrema"] = ch
+    if zero:
+        metadata["all_zero_channels"] = zero
+        metadata["hint"] = (
+            "channel(s) {} are all-zero in the LDR preview, so the image "
+            "may look black/wrong for that reason alone. Use "
+            "summarize_texture(resource_id, event_id) for raw per-channel "
+            "min/max/NaN before concluding the render target is wrong."
+        ).format(zero)
+
+
 def _fetch_and_decode_texture(
     resource_id, event_id, mip, slice, sample, max_size,
     region_x, region_y, region_w, region_h,
-    channel, black_point, white_point, instance,
+    channel, black_point, white_point, instance, timeout=300.0,
 ):
     """Fetch a texture through the pool, decode + post-process to a Pillow Image.
 
@@ -964,7 +1007,7 @@ def _fetch_and_decode_texture(
         "mip"         : mip,
         "slice"       : slice,
         "sample"      : sample,
-    }, alias=instance)
+    }, alias=instance, read_timeout=timeout)
 
     if not resp.get("ok"):
         return None, None, resp
@@ -986,6 +1029,13 @@ def _fetch_and_decode_texture(
             "ok"    : False,
             "error" : f"unsupported texture format: {fmt_name}. use RenderDoc's texture viewer instead.",
         }
+
+    # Per-channel extrema of the LDR preview, computed before channel
+    # extraction collapses it to one band. Surfaces the "looks black but
+    # isn't" trap: a render target whose content sits only in G/B/A reads
+    # as solid black if you eyeball the R channel — flag the dead bands so
+    # a wrong-colour diagnosis isn't anchored on a misleading preview.
+    _annotate_channel_extrema(img, metadata)
 
     if channel >= 0:
         bands = img.split()
