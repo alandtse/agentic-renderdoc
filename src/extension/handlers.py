@@ -817,10 +817,13 @@ def handle_reload(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     Rebuilds the API index and clears the serializer cache.
     """
     import importlib
-    from . import serialize, api_index, utilities
+    from . import serialize, concepts, api_index, utilities
 
     # Reload in dependency order: leaves first, then this module.
+    # concepts before api_index: build_index() imports CONCEPTS from it,
+    # so the curated entries only refresh if concepts is reloaded first.
     importlib.reload(serialize)
+    importlib.reload(concepts)
     importlib.reload(api_index)
     importlib.reload(utilities)
 
@@ -847,7 +850,7 @@ def handle_reload(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ok"   : True,
         "data" : {
-            "reloaded"  : ["serialize", "api_index", "utilities", "handlers"],
+            "reloaded"  : ["serialize", "concepts", "api_index", "utilities", "handlers"],
             "handlers"  : list(old_handlers.keys()),
         },
     }
