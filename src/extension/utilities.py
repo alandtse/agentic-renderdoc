@@ -1826,8 +1826,11 @@ def _format_name(fmt: Any) -> Optional[str]:
 def _coerce_rid_int(ident: Any) -> Optional[int]:
     """Extract the integer handle from an int or a string id.
 
-    Accepts a plain int, a digit string ("123"), or a "ResourceId(123)"
-    style string. Returns None if no integer can be found.
+    Accepts a plain int, an all-digit string ("123"), or a
+    "ResourceId(123)" string. Returns None otherwise — deliberately
+    strict so a stray-digit string (e.g. a format name like
+    "R16G16B16A16_FLOAT") is rejected instead of silently resolving to
+    an unrelated resource via the embedded "16".
     """
     if isinstance(ident, bool):
         return None
@@ -1835,9 +1838,12 @@ def _coerce_rid_int(ident: Any) -> Optional[int]:
         return ident
     if isinstance(ident, str):
         import re as _re
-        m = _re.search(r"\d+", ident)
+        s = ident.strip()
+        if s.isdigit():
+            return int(s)
+        m = _re.fullmatch(r"ResourceId\((\d+)\)", s)
         if m:
-            return int(m.group(0))
+            return int(m.group(1))
     return None
 
 
