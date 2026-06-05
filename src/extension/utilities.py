@@ -1799,6 +1799,194 @@ def make_highlight_drawcall(ctx: Any) -> Callable[..., dict]:
     return highlight_drawcall
 
 
+# --- Convenience accessors (int-friendly, plain-dict returns) ---
+
+def _run_replay(ctx: Any, fn: Callable[[Any], Any], controller: Any) -> Any:
+    """Run fn(controller) on the replay thread, reusing an active one.
+
+    Mirrors the dispatch idiom in get_resource_name / describe_draws so
+    these helpers work both inside and outside a ctx.replay() callback.
+    """
+    if controller is not None:
+        return fn(controller)
+    active = ctx._replay_controller
+    if active is not None:
+        return fn(active)
+    return ctx.replay(fn)
+
+
+def _format_name(fmt: Any) -> Optional[str]:
+    """ResourceFormat name via .Name() (a method, not a .name property)."""
+    try:
+        return fmt.Name()
+    except Exception:
+        return None
+
+
+def _coerce_rid_int(ident: Any) -> Optional[int]:
+    """Extract the integer handle from an int or a string id.
+
+    Accepts a plain int, an all-digit string ("123"), or a
+    "ResourceId(123)" string. Returns None otherwise — deliberately
+    strict so a stray-digit string (e.g. a format name like
+    "R16G16B16A16_FLOAT") is rejected instead of silently resolving to
+    an unrelated resource via the embedded "16".
+    """
+    if isinstance(ident, bool):
+        return None
+    if isinstance(ident, int):
+        return ident
+    if isinstance(ident, str):
+        import re as _re
+        s = ident.strip()
+        if s.isdigit():
+            return int(s)
+        m = _re.fullmatch(r"ResourceId\((\d+)\)", s)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _resolve_resource_id(ctrl: Any, ident: Any) -> Any:
+    """Resolve an int / string / ResourceId into a live ResourceId.
+
+    GetUsage and friends need the opaque ResourceId object, not an int.
+    Scans GetResources() for a matching integer handle. Returns None if
+    unresolvable.
+    """
+    if rd is not None and isinstance(ident, rd.ResourceId):
+        return ident
+    target = _coerce_rid_int(ident)
+    if target is None:
+        return None
+    for res in ctrl.GetResources():
+        if int(res.resourceId) == target:
+            return res.resourceId
+    return None
+
+
+def make_get_outputs(ctx: Any) -> Callable[..., dict]:
+    """Create a get_outputs accessor bound to the given HandlerContext.
+
+    Returns the bound color render targets and depth target at an event
+    as plain dicts — the common "what is this draw writing to?" lookup
+    without hand-rolling GetOutputTargets()/GetDepthTarget().
+    """
+    def get_outputs(eventId: Optional[int] = None,
+                    controller: Any = None) -> dict:
+        """Color + depth output targets at an event.
+
+        eventId    -- Seek the replay cursor here first (omit to use the
+                      current cursor). Required for an accurate answer at
+                      a specific draw.
+        controller -- Optional ReplayController if already inside replay.
+        """
+        from . import serialize
+
+        def _work(ctrl: Any) -> dict:
+            if eventId is not None:
+                ctrl.SetFrameEvent(int(eventId), True)
+            state = ctrl.GetPipelineState()
+            color = []
+            try:
+                for rt in state.GetOutputTargets():
+                    if int(rt.resource) != 0:
+                        color.append({
+                            "resource"   : serialize.resource_id(rt.resource),
+                            "format"     : _format_name(rt.format),
+                            "firstMip"   : int(getattr(rt, "firstMip", 0)),
+                            "firstSlice" : int(getattr(rt, "firstSlice", 0)),
+                        })
+            except Exception:
+                pass
+            depth = None
+            try:
+                d = state.GetDepthTarget()
+                if d and int(d.resource) != 0:
+                    depth = {
+                        "resource" : serialize.resource_id(d.resource),
+                        "format"   : _format_name(d.format),
+                    }
+            except Exception:
+                pass
+            return {"event_id": eventId, "color": color, "depth": depth}
+
+        return _run_replay(ctx, _work, controller)
+
+    return get_outputs
+
+
+def make_get_viewport(ctx: Any) -> Callable[..., dict]:
+    """Create a get_viewport accessor bound to the given HandlerContext."""
+    def get_viewport(eventId: Optional[int] = None, index: int = 0,
+                     controller: Any = None) -> dict:
+        """Viewport rectangle at an event as a plain dict.
+
+        eventId    -- Seek the replay cursor here first (omit for current).
+        index      -- Viewport index (default 0).
+        controller -- Optional ReplayController if already inside replay.
+        """
+        def _work(ctrl: Any) -> dict:
+            if eventId is not None:
+                ctrl.SetFrameEvent(int(eventId), True)
+            state = ctrl.GetPipelineState()
+            vp = state.GetViewport(int(index))
+            return {
+                "index"    : int(index),
+                "x"        : vp.x,
+                "y"        : vp.y,
+                "width"    : vp.width,
+                "height"   : vp.height,
+                "minDepth" : vp.minDepth,
+                "maxDepth" : vp.maxDepth,
+            }
+
+        return _run_replay(ctx, _work, controller)
+
+    return get_viewport
+
+
+def make_usage(ctx: Any) -> Callable[..., dict]:
+    """Create a usage accessor bound to the given HandlerContext.
+
+    Wraps ReplayController.GetUsage, which requires a ResourceId object
+    (not an int) — a documented round-trip trap. This accepts an int,
+    a string id, or a ResourceId and returns plain dicts.
+    """
+    def usage(resource: Any, controller: Any = None) -> dict:
+        """Every event that used a resource, with the usage kind.
+
+        resource   -- ResourceId, int handle, or string id (as returned
+                      by describe_draw / serialize.resource_id).
+        controller -- Optional ReplayController if already inside replay.
+
+        Returns {"resource": str, "usage": [{"eventId", "usage"}, ...]}
+        or a structured error if the id can't be resolved.
+        """
+        from . import serialize
+
+        def _work(ctrl: Any) -> dict:
+            rid = _resolve_resource_id(ctrl, resource)
+            if rid is None:
+                return {
+                    "ok"    : False,
+                    "error" : "could not resolve {!r} to a ResourceId; "
+                              "pass an id from describe_draw / "
+                              "GetResources()".format(resource),
+                }
+            out = []
+            for eu in ctrl.GetUsage(rid):
+                out.append({
+                    "eventId" : int(eu.eventId),
+                    "usage"   : getattr(eu.usage, "name", str(eu.usage)),
+                })
+            return {"resource": serialize.resource_id(rid), "usage": out}
+
+        return _run_replay(ctx, _work, controller)
+
+    return usage
+
+
 # --- Binding ---
 
 def bind_utilities(ctx: Any) -> Dict[str, Any]:
@@ -1820,6 +2008,9 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "find_marker"          : make_find_marker(ctx),
         "describe_draw"        : make_describe_draw(ctx),
         "describe_draws"       : make_describe_draws(ctx),
+        "get_outputs"          : make_get_outputs(ctx),
+        "get_viewport"         : make_get_viewport(ctx),
+        "usage"                : make_usage(ctx),
         "goto_event"           : make_goto_event(ctx),
         "view_texture"         : make_view_texture(ctx),
         "save_texture"         : make_save_texture(ctx),
