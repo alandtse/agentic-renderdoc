@@ -475,6 +475,23 @@ def eval(code: str, instance: str | None = None,
             Must be called inside a ctx.replay() callback. Returns a dict
             with stage name, raw_hex string, and decoded variables list.
 
+        get_outputs(eventId=None)
+            Bound color render targets + depth target at an event as
+            plain dicts: {"color": [{"resource", "format", ...}],
+            "depth": {...}}. The quick "what is this draw writing to?"
+            lookup without GetOutputTargets()/GetDepthTarget() by hand.
+
+        get_viewport(eventId=None, index=0)
+            Viewport rect at an event as a plain dict (x, y, width,
+            height, minDepth, maxDepth).
+
+        usage(resource)
+            Every event that used a resource, with the usage kind.
+            Wraps GetUsage, which requires a ResourceId OBJECT — this
+            accepts an int, a string id (as returned by describe_draw /
+            serialize.resource_id), or a ResourceId, resolving it for
+            you. Returns {"resource", "usage": [{"eventId", "usage"}]}.
+
     Serialization:
         The `serialize` module converts RenderDoc C++ types to plain
         dicts for JSON transport. Useful functions:
@@ -1312,6 +1329,12 @@ def instance(
                 disconnect/close/set_default/captures/load_capture/
                 close_capture: which alias to target. If omitted with
                 exactly one connection active, that one is used.
+                PIN an explicit alias to keep it stable — an auto-derived
+                one re-keys after a target restart (e.g. "vr" ->
+                "port_19876"). After a restart, connect to the new port
+                under the SAME alias and the pool rebinds the name to it,
+                so Eval(instance="vr") keeps working
+                (see concept:stable_connection_aliases).
 
     Capture discovery directories for ``discover`` default to
     ``/tmp/RenderDoc`` (Linux) or ``%TEMP%\\RenderDoc`` (Windows). Add

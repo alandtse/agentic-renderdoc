@@ -357,6 +357,137 @@ auto-frees the trace handle so it can't be reused for stepping.
 """,
     },
 
+    # --- API discovery cheat-sheet ---
+    {
+        "name"      : "concept:api_gotchas",
+        "kind"      : "concept",
+        "signature" : "common RenderDoc Python attribute traps",
+        "doc"       : """\
+Attribute mismatches that cost round-trips, with the correct form:
+
+  - Action names: there is NO controller.GetAction(eid). Action
+    objects carry their own name — action.GetName(ctx.structured_file).
+    Find the action with the recursive tree walk, or just use
+    describe_draw(eventId=eid) / find_marker(name).
+
+  - Bound-resource lists return UsedDescriptor, which wraps a single
+    Descriptor in ``.descriptor`` (singular) — there is no
+    ``.descriptors``:
+        ud.descriptor.resource    # the bound ResourceId
+        ud.descriptor.byteOffset  # NOT ud.descriptors / .resourceId
+
+  - Descriptor.resource (a ResourceId), not Descriptor.resourceId.
+
+  - Depth/stencil TEST state (enable, write, compare func) is NOT on
+    the API-agnostic PipeState. Use the API-specific object:
+        controller.GetD3D11PipelineState().outputMerger.depthStencilState
+        controller.GetVulkanPipelineState().depthStencil
+
+  - controller.GetUsage(rid) needs a ResourceId OBJECT, not an int.
+    Get it from GetTextures()/GetResources(), or just call the
+    ``usage(resource)`` helper which accepts an int/string and resolves
+    it (see concept:resource_usage).
+
+  - ResourceFormat name is fmt.Name() (a method), not fmt.name.
+
+When in doubt, inspect(obj) lists the real attributes, and Search-API
+looks up exact signatures.
+""",
+    },
+    {
+        "name"      : "concept:resource_usage",
+        "kind"      : "concept",
+        "signature" : "usage(resource) / controller.GetUsage(ResourceId)",
+        "doc"       : """\
+"Which events touched this resource, and how?"
+
+    usage("12345")        # int, string id, or ResourceId all accepted
+    # -> {'resource': '12345',
+    #     'usage': [{'eventId': 412, 'usage': 'ColorTarget'},
+    #               {'eventId': 980, 'usage': 'PS_Resource'}, ...]}
+
+The helper wraps controller.GetUsage, which raw requires a ResourceId
+OBJECT (passing an int raises). Pass an id straight from describe_draw
+or get_outputs and it resolves the handle for you.
+""",
+    },
+    {
+        "name"      : "concept:output_targets_and_viewport",
+        "kind"      : "concept",
+        "signature" : "get_outputs(eventId) / get_viewport(eventId)",
+        "doc"       : """\
+"What is this draw writing to, and where on screen?"
+
+    get_outputs(eventId=412)
+    # -> {'color': [{'resource': '88', 'format': 'R16G16B16A16_FLOAT',
+    #                'firstMip': 0, 'firstSlice': 0}],
+    #     'depth': {'resource': '90', 'format': 'D32_FLOAT'}}
+
+    get_viewport(eventId=412)
+    # -> {'index': 0, 'x': 0.0, 'y': 0.0, 'width': 8688.0,
+    #     'height': 4615.0, 'minDepth': 0.0, 'maxDepth': 1.0}
+
+Both seek to eventId first (omit to use the current cursor) and return
+plain dicts — no GetOutputTargets()/GetViewport() boilerplate. Hand a
+returned color/depth ``resource`` straight to Get-Texture,
+summarize_texture, or usage().
+""",
+    },
+
+    # --- Fresh captures ---
+    {
+        "name"      : "concept:capture_completion_signal",
+        "kind"      : "concept",
+        "signature" : "Instance(action=trigger_capture) waits for NewCapture",
+        "doc"       : """\
+After TriggerCapture, the NewCapture message often does NOT arrive in
+a short ReceiveMessage pump — a raw scripted trigger leaves you with
+no reliable in-API "it's ready" signal, and a multi-GB VR .rdc takes
+several seconds to finish writing.
+
+Use Instance(action="trigger_capture") instead of scripting
+TriggerCapture by hand: it pumps ReceiveMessage up to ``wait_secs``
+(default 10, max 300) and returns each arrival's ``target_path`` and
+``byteSize`` once NewCapture lands, with ``complete: true`` when all
+requested frames arrived:
+
+    Instance(action="trigger_capture", target_ident=38920,
+             num_frames=1, wait_secs=30, directory="C:/caps/")
+
+If a capture is slow to write, raise ``wait_secs``. With ``directory=``
+set, each file is CopyCapture'd locally (a synchronous, complete copy);
+without it you get the on-target path, which may still be flushing — if
+you must read it directly, wait for its size to stop growing.
+""",
+    },
+
+    # --- Connections ---
+    {
+        "name"      : "concept:stable_connection_aliases",
+        "kind"      : "concept",
+        "signature" : "pin alias= on connect/open; rebind after restart",
+        "doc"       : """\
+A connection alias auto-derived from the capture re-keys after a
+game/target restart (e.g. "vr" -> "port_19876"), breaking later
+Eval(instance="vr") calls.
+
+Always PIN an explicit alias so it never auto-derives:
+
+    Instance(action="connect", port=19876, alias="vr")
+    Instance(action="open",    file="vr.rdc", alias="vr")
+
+After a restart the old port is dead. Reconnect to the NEW port under
+the SAME alias — the pool evicts the stale entry and rebinds the name:
+
+    Instance(action="list")                      # find the new port
+    Instance(action="connect", port=19880, alias="vr")  # "vr" now -> 19880
+
+Eval(instance="vr", ...) keeps working across the restart. Use
+Instance(action="set_default", alias="vr") to drop the instance= arg
+entirely.
+""",
+    },
+
     # --- Safety ---
     {
         "name"      : "concept:dont_load_or_close_from_eval",
