@@ -45,6 +45,11 @@ if sys.platform != "win32":
             """Enable SO_REUSEADDR so the port can be rebound immediately."""
             self._sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
 
+        def setsockopt_exclusive(self):
+            """Exclusive bind. POSIX refuses a second live bind anyway, so
+            SO_REUSEADDR (TIME_WAIT reuse only) is harmless here."""
+            self.setsockopt_reuse()
+
         def bind(self, host: str, port: int):
             """Bind to the given address and port."""
             self._sock.bind((host, port))
@@ -95,6 +100,7 @@ else:
     IPPROTO_TCP     = 6
     SOL_SOCKET      = 0xFFFF
     SO_REUSEADDR    = 4
+    SO_EXCLUSIVEADDRUSE = -5  # ~SO_REUSEADDR; bind() fails if the port is in use.
     INVALID_SOCKET  = ~0 & 0xFFFFFFFFFFFFFFFF
     SOCKET_ERROR    = -1
     INADDR_LOOPBACK = 0x7F000001  # 127.0.0.1; needs htonl before use.
@@ -234,16 +240,25 @@ else:
                 if self._handle == INVALID_SOCKET:
                     raise SocketError("socket")
 
-        def setsockopt_reuse(self):
-            """Enable SO_REUSEADDR so the port can be rebound immediately."""
+        def _setsockopt_bool(self, optname):
+            """Set a boolean (int=1) SOL_SOCKET option, raising on failure."""
             val    = ctypes.c_int(1)
             result = ws2_32.setsockopt(
-                self._handle, SOL_SOCKET, SO_REUSEADDR,
+                self._handle, SOL_SOCKET, optname,
                 ctypes.cast(ctypes.byref(val), ctypes.c_char_p),
                 ctypes.sizeof(val),
             )
             if result == SOCKET_ERROR:
                 raise SocketError("setsockopt")
+
+        def setsockopt_reuse(self):
+            """Enable SO_REUSEADDR so the port can be rebound immediately."""
+            self._setsockopt_bool(SO_REUSEADDR)
+
+        def setsockopt_exclusive(self):
+            """SO_EXCLUSIVEADDRUSE: make bind() fail on an in-use port (vs the
+            SO_REUSEADDR hijack) so the port-range loop advances to a free one."""
+            self._setsockopt_bool(SO_EXCLUSIVEADDRUSE)
 
         def bind(self, host: str, port: int):
             """Bind to the given address and port.
