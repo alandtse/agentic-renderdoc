@@ -1884,6 +1884,51 @@ def _resolve_resource_id(ctrl: Any, ident: Any) -> Any:
     return None
 
 
+def make_describe_resource(ctx: Any) -> Callable[..., dict]:
+    """Create a describe_resource accessor bound to the given HandlerContext."""
+    def describe_resource(resource: Any, controller: Any = None) -> dict:
+        """Resolve a ResourceId/Descriptor/UsedDescriptor to its dimensions.
+
+        Accepts an int, a "ResourceId(n)" string, an rd.ResourceId, or any
+        descriptor carrying ``.resource`` (Descriptor) or ``.descriptor``
+        (UsedDescriptor) — so going from a binding to (width, height,
+        array_size, mips, format, type) is one call instead of matching
+        GetTextures() by hand.
+
+        Returns the TextureDescription dict, the BufferDescription dict, or
+        an {"error"/"note"} dict.
+        """
+        from . import serialize
+
+        ident = resource
+        if hasattr(ident, "descriptor"):    # UsedDescriptor -> Descriptor
+            ident = ident.descriptor
+        ident = getattr(ident, "resource", ident)   # Descriptor -> ResourceId
+
+        def _do(ctrl: Any) -> dict:
+            rid = _resolve_resource_id(ctrl, ident)
+            if rid is None:
+                return {"error": "could not resolve resource: {!r}".format(resource)}
+            target = int(rid)
+            for t in ctrl.GetTextures():
+                if int(t.resourceId) == target:
+                    return serialize.texture_description(t)
+            for b in ctrl.GetBuffers():
+                if int(b.resourceId) == target:
+                    return serialize.buffer_description(b)
+            return {"resource" : serialize.resource_id(rid),
+                    "note"     : "resolved but not a texture or buffer (sampler/view/etc.)"}
+
+        if controller is not None:
+            return _do(controller)
+        active = ctx._replay_controller
+        if active is not None:
+            return _do(active)
+        return ctx.replay(_do)
+
+    return describe_resource
+
+
 def make_get_outputs(ctx: Any) -> Callable[..., dict]:
     """Create a get_outputs accessor bound to the given HandlerContext.
 
@@ -2173,6 +2218,7 @@ def bind_utilities(ctx: Any) -> Dict[str, Any]:
         "goto_event"           : make_goto_event(ctx),
         "view_texture"         : make_view_texture(ctx),
         "save_texture"         : make_save_texture(ctx),
+        "describe_resource"    : make_describe_resource(ctx),
         "highlight_drawcall"   : make_highlight_drawcall(ctx),
         "auto_decode_cb"       : make_auto_decode_cb(ctx),
         "interpret_buffer"     : interpret_buffer,
