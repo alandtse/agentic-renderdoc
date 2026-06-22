@@ -96,7 +96,12 @@ class _QtBridge:
         return self._port
 
     def start(self) -> None:
-        """Bind to the first available port and start listening."""
+        """Bind to the first free port in the range and start listening.
+
+        No anti-hijack handling needed: QTcpServer binds exclusively on
+        Windows, so listen() fails on an in-use port and a second instance
+        falls through to the next (the winsock path does this explicitly).
+        """
         qt = _try_import_qt()
         if qt is None:
             raise RuntimeError("_QtBridge.start called but no Qt binding available")
@@ -231,11 +236,9 @@ class _ThreadedBridge:
         for port in self._port_range:
             try:
                 self._server_socket = winsock.Socket()
-                # SO_REUSEADDR so we can rebind a port the parent
-                # process (or a prior worker) just released. The MCP
-                # server's port-discovery probe also uses SO_REUSEADDR
-                # for the same reason.
-                self._server_socket.setsockopt_reuse()
+                # Exclusive bind: on Windows SO_REUSEADDR lets a 2nd instance
+                # share an in-use port, collapsing every GUI onto 19876.
+                self._server_socket.setsockopt_exclusive()
                 self._server_socket.bind("127.0.0.1", port)
                 self._server_socket.listen(5)
                 self._port = port

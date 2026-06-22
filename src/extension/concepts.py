@@ -534,4 +534,62 @@ Use the Instance tool instead, which dispatches via invoke_ui:
     Instance(action="close_capture", alias="my-instance")
 """,
     },
+
+    # --- API drift: removed / renamed names ---
+    # Named after the missing API so a search for it matches and redirects,
+    # instead of returning nothing and forcing trial-and-error.
+    {
+        "name"      : "GetConstantBuffers",
+        "kind"      : "concept",
+        "signature" : "PipelineState.GetConstantBlocks(stage)  +  auto_decode_cb(stage, slot)",
+        "doc"       : """\
+There is no GetConstantBuffers / GetConstantBuffer on PipelineState in
+this RenderDoc API — the accessor is GetConstantBlocks(stage). To read
+and decode a constant buffer, prefer the helper:
+
+    auto_decode_cb("ps", slot=0, eventId=412)
+
+Raw chain if you need it: state.GetConstantBlocks(stage)[slot].descriptor
+gives .resource / .byteOffset / .byteSize; then
+controller.GetBufferData(resource, off, size). See
+concept:read_constant_buffer.
+""",
+    },
+    {
+        "name"      : "Descriptor.resourceId",
+        "kind"      : "concept",
+        "signature" : "Descriptor.resource  (ResourceId)",
+        "doc"       : """\
+A Descriptor has no .resourceId in this API — the field is .resource (a
+ResourceId). Applies to descriptors from GetConstantBlocks(),
+GetReadOnlyResources(), and the output-merger targets:
+
+    depth = state.GetDepthTarget()   # a Descriptor
+    rid   = depth.resource           # NOT depth.resourceId
+
+Caveat: TextureDescription and BufferDescription DO use .resourceId; the
+rename is only on Descriptor.
+""",
+    },
+    {
+        "name"      : "concept:getusage_empty_on_aliased_resource",
+        "kind"      : "concept",
+        "signature" : "GetUsage(rid) is keyed by exact ResourceId; copies/aliases read a different id",
+        "doc"       : """\
+GetUsage(resourceId) lists usage for THAT exact ResourceId only. If a
+later pass samples an aliased COPY of a resource (a different
+ResourceId), those reads do not appear under the original — GetUsage can
+return just Clear + DepthStencilTarget with no SRV reads. This is a
+RenderDoc data limitation, not a bug, and following the original id
+dead-ends.
+
+To walk from a sampled value back to its real source, use pixel history
+on the consuming draw's output and inspect the contributing events:
+
+    pixel_history(resource_id=<RT/backbuffer>, x=.., y=.., event_id=..)
+
+Also scan get_all_actions() for Copy/Resolve events around the draw to
+spot where the alias was produced, then GetUsage() that copy's id.
+""",
+    },
 ]
