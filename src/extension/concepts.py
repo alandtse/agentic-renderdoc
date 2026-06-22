@@ -592,4 +592,57 @@ Also scan get_all_actions() for Copy/Resolve events around the draw to
 spot where the alias was produced, then GetUsage() that copy's id.
 """,
     },
+
+    # --- Resource inspection / pixel-debug recovery ---
+    {
+        "name"      : "concept:resource_dimensions",
+        "kind"      : "concept",
+        "signature" : "describe_resource(resource_id_or_descriptor)",
+        "doc"       : """\
+Resolve any binding to its dimensions/format in one call — no manual
+GetTextures() matching:
+
+    describe_resource(707)              # int / "ResourceId(707)" / rd.ResourceId
+    describe_resource(desc)             # a Descriptor (.resource)
+    describe_resource(used_descriptor)  # a UsedDescriptor (.descriptor.resource)
+    # -> {'resource_id':..., 'type':'Texture2DArray', 'width':4615,
+    #     'height':4615, 'array_size':4, 'mips':1,
+    #     'format':{...'D24S8_TYPELESS'...}, ...}
+
+Returns the TextureDescription (or BufferDescription) dict.
+""",
+    },
+    {
+        "name"      : "concept:constant_buffer_values_at_debug_pixel",
+        "kind"      : "concept",
+        "signature" : "auto_decode_cb(stage, slot, eventId=<debug event>)",
+        "doc"       : """\
+DebugPixel's trace constantBlocks are unreliable for recovering CB
+values — often anonymous or empty for resolve/utility passes. To read
+the named constants a shader used at the debugged event, call
+auto_decode_cb at that event instead:
+
+    auto_decode_cb("ps", slot=0, eventId=412)
+    # -> {'name':'VRValues', 'decoded':[{'name':'StereoEnabled',...}, ...]}
+
+Works whether or not the pixel debugger populated the trace.
+""",
+    },
+    {
+        "name"      : "concept:typeless_or_aliased_depth_array",
+        "kind"      : "concept",
+        "signature" : "GetUsage/PickPixel on a typeless array parent are empty/0",
+        "doc"       : """\
+A typeless array (e.g. a D24S8_TYPELESS Texture2DArray of shadow
+cascades) is read/written only through typed VIEWS with their own
+ResourceIds. On the typeless PARENT resource:
+  - GetUsage(parent) is empty — no SRV/DSV; usage lives on the views.
+  - PickPixel(parent, ...) returns 0 for every slice.
+
+Find the typed view's ResourceId (the binding's descriptor.resource at
+the consuming event), then GetUsage / PickPixel / describe_resource THAT
+id. Per-slice values: read with Subresource(mip, slice, sample); for a
+depth format PickPixel needs an explicit CompType (e.g. Depth).
+""",
+    },
 ]
