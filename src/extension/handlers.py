@@ -572,7 +572,9 @@ def handle_capture_list(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
     description="Enumerate running processes that have the RenderDoc layer loaded.",
     schema={
         "properties": {
-            "host" : {"type": "string", "description": "URL/host to scan (empty = localhost)."},
+            "host"      : {"type": "string", "description": "URL/host to scan (empty = localhost)."},
+            "match"     : {"type": "string", "description": "Case-insensitive substring of the executable name; matching targets are returned under 'matched'."},
+            "wait_secs" : {"type": "number", "description": "With 'match', poll until a matching target appears or this many seconds elapse (e.g. after injecting a game whose device takes a moment to register). Default: single pass."},
         },
     },
 )
@@ -585,61 +587,92 @@ def handle_targets_list(ctx, params):
     and busy-client (if another tool already has the connection
     open). Each probe Shutdown()s before moving on so we don't keep
     the target busy.
+
+    Pass ``match`` to filter targets by executable-name substring
+    (case-insensitive), and ``wait_secs`` to poll until one appears —
+    useful right after injecting a game, whose graphics device takes a
+    moment to register a target and whose process is otherwise hard to
+    tell from sibling helpers (e.g. SteamVR's).
     """
     import renderdoc as rd
+    import time
 
-    host = params.get("host") or ""
+    host        = params.get("host") or ""
+    match       = params.get("match")
+    wait_secs   = params.get("wait_secs")
     client_name = "agentic-renderdoc"
 
-    targets = []
-    next_ident = 0
-    # Hard cap on probes — pathological hosts can otherwise spin.
-    for _ in range(64):
-        try:
-            next_ident = rd.EnumerateRemoteTargets(host, next_ident)
-        except Exception as e:
-            return {"ok": False, "error": "EnumerateRemoteTargets failed: {}".format(e)}
-        if not next_ident:
+    def _enumerate():
+        # Returns (targets, error_str). Hard cap on probes — pathological
+        # hosts can otherwise spin.
+        targets = []
+        next_ident = 0
+        for _ in range(64):
+            try:
+                next_ident = rd.EnumerateRemoteTargets(host, next_ident)
+            except Exception as e:
+                return None, "EnumerateRemoteTargets failed: {}".format(e)
+            if not next_ident:
+                break
+
+            probe = None
+            info = {"ident": int(next_ident)}
+            try:
+                probe = rd.CreateTargetControl(host, int(next_ident),
+                                               client_name, False)
+                if probe is not None:
+                    try:
+                        info["target"]      = str(probe.GetTarget())
+                    except Exception:
+                        pass
+                    try:
+                        info["api"]         = str(probe.GetAPI())
+                    except Exception:
+                        pass
+                    try:
+                        info["pid"]         = int(probe.GetPID())
+                    except Exception:
+                        pass
+                    try:
+                        busy = str(probe.GetBusyClient())
+                        if busy:
+                            info["busy_client"] = busy
+                    except Exception:
+                        pass
+            except Exception as e:
+                info["probe_error"] = str(e)
+            finally:
+                if probe is not None:
+                    try:
+                        probe.Shutdown()
+                    except Exception:
+                        pass
+
+            targets.append(info)
+        return targets, None
+
+    def _matching(targets):
+        m = (match or "").lower()
+        return [t for t in targets if m in str(t.get("target", "")).lower()]
+
+    # Only poll when both a name to wait for and a budget are given.
+    deadline = (time.time() + float(wait_secs)) if (match and wait_secs) else None
+    while True:
+        targets, err = _enumerate()
+        if err is not None:
+            return {"ok": False, "error": err}
+        matched = _matching(targets) if match else []
+        if matched or deadline is None or time.time() >= deadline:
             break
+        time.sleep(0.5)
 
-        probe = None
-        info = {"ident": int(next_ident)}
-        try:
-            probe = rd.CreateTargetControl(host, int(next_ident),
-                                           client_name, False)
-            if probe is not None:
-                # If another tool has the connection open, RenderDoc reports a
-                # busy_client and the probe is still useful for metadata.
-                try:
-                    info["target"]      = str(probe.GetTarget())
-                except Exception:
-                    pass
-                try:
-                    info["api"]         = str(probe.GetAPI())
-                except Exception:
-                    pass
-                try:
-                    info["pid"]         = int(probe.GetPID())
-                except Exception:
-                    pass
-                try:
-                    busy = str(probe.GetBusyClient())
-                    if busy:
-                        info["busy_client"] = busy
-                except Exception:
-                    pass
-        except Exception as e:
-            info["probe_error"] = str(e)
-        finally:
-            if probe is not None:
-                try:
-                    probe.Shutdown()
-                except Exception:
-                    pass
-
-        targets.append(info)
-
-    return {"ok": True, "data": {"host": host or "localhost", "targets": targets}}
+    data = {"host": host or "localhost", "targets": targets}
+    if match:
+        data["match"]   = match
+        data["matched"] = matched
+        if deadline is not None:
+            data["timed_out"] = not matched
+    return {"ok": True, "data": data}
 
 
 @handler(
