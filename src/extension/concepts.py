@@ -645,4 +645,42 @@ id. Per-slice values: read with Subresource(mip, slice, sample); for a
 depth format PickPixel needs an explicit CompType (e.g. Depth).
 """,
     },
+
+    # --- Capture target injection ---
+    {
+        "name"      : "concept:inject_and_capture",
+        "kind"      : "concept",
+        "signature" : "Instance(action='targets', match='Game.exe', wait_secs=N)",
+        "doc"       : """\
+After ExecuteAndInject(..., opts.hookIntoChildren=True) the returned
+ident is often a sibling helper (e.g. SteamVR's vrserver/vrcompositor),
+not the game, and the game's D3D device takes a moment to register a
+control target. Wait for the right one by name instead of guessing:
+
+    Instance(action="targets", match="SkyrimVR", wait_secs=30)
+    # -> {'matched': [{'ident': 38921, 'target': 'SkyrimVR',
+    #                  'api': 'D3D11', 'pid': ...}], 'timed_out': False, ...}
+    Instance(action="trigger_capture", target_ident=38921)
+
+'matched' filters by case-insensitive substring of the reported image
+name (GetTarget(), often without the '.exe'); 'timed_out' is True when
+none appeared within wait_secs.
+""",
+    },
+    {
+        "name"      : "concept:injectintoprocess_ident_zero",
+        "kind"      : "concept",
+        "signature" : "InjectIntoProcess(pid) -> ident 0 when the device already exists",
+        "doc"       : """\
+rd.InjectIntoProcess(pid) hooks a process only if it loads the capture
+layer BEFORE creating its graphics device. Injecting into an
+already-running game that already made its D3D device returns
+{result: Success, ident: 0} with no enumerable target — the hook missed
+the device.
+
+For an already-launched game, relaunch it under RenderDoc with
+ExecuteAndInject (which injects before device creation), then wait for
+the target with Instance(action="targets", match=..., wait_secs=...).
+""",
+    },
 ]

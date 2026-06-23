@@ -1293,6 +1293,7 @@ def instance(
     frame_number       : int | None = None,
     wait_secs          : float      = 10.0,
     host               : str | None = None,
+    match              : str | None = None,
     async_mode         : bool       = False,
     timeout            : float | None = None,
     bind_wait          : float | None = None,
@@ -1378,7 +1379,11 @@ def instance(
                                  PID, and current API. These are not the
                                  same thing as analyzer instances —
                                  they're the live programs you'd ask
-                                 to take a frame capture.
+                                 to take a frame capture. Pass ``match``
+                                 (exe-name substring) to filter, and
+                                 ``wait_secs`` to poll until a matching
+                                 target appears — e.g. after injecting a
+                                 game, to skip sibling helper processes.
              - ``trigger_capture``:
                                  Tell a running target to capture
                                  ``num_frames`` (default 1) sequential
@@ -1563,6 +1568,9 @@ def instance(
         params: dict = {}
         if host is not None:
             params["host"] = host
+        if match is not None:
+            params["match"] = match
+            params["wait_secs"] = wait_secs   # only honoured alongside match
         try:
             return _pool.send("targets_list", params, alias=alias,
                               read_timeout=30.0)
