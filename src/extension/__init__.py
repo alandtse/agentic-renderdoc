@@ -18,7 +18,33 @@ from .context import GuiHandlerContext, HandlerContext
 # --- Module state ---
 
 _extension : Any                    = None
+_extension_ctx : Any                = None
 _server    : Optional[BridgeServer] = None
+
+
+def _teardown() -> None:
+    """Stop active extension resources without leaving stale module state."""
+    global _extension, _extension_ctx, _server
+
+    server        = _server
+    extension     = _extension
+    extension_ctx = _extension_ctx
+
+    try:
+        if server is not None:
+            server.stop()
+    except Exception as exc:
+        print("[Agentic] Bridge stop failed: {}".format(exc))
+
+    try:
+        if extension is not None and extension_ctx is not None:
+            extension_ctx.RemoveCaptureViewer(extension)
+    except Exception as exc:
+        print("[Agentic] CaptureViewer removal failed: {}".format(exc))
+    finally:
+        _server        = None
+        _extension     = None
+        _extension_ctx = None
 
 
 def register(version: str, ctx: Any) -> None:
@@ -37,7 +63,7 @@ def register(version: str, ctx: Any) -> None:
     coexistence), with incoming connections being routed to the
     GUI-context bridge instead of the embedded one.
     """
-    global _extension, _server
+    global _extension, _extension_ctx, _server
 
     import os
     if os.environ.get("AGENTIC_DISABLE_AUTOLOAD"):
@@ -45,6 +71,10 @@ def register(version: str, ctx: Any) -> None:
         return
 
     print(f"[Agentic] Registering (RenderDoc {version})")
+
+    if _server is not None or _extension is not None or _extension_ctx is not None:
+        print("[Agentic] Existing registration found; cleaning up")
+        _teardown()
 
     import qrenderdoc as qrd
 
@@ -72,26 +102,24 @@ def register(version: str, ctx: Any) -> None:
 
     handler_ctx = GuiHandlerContext(ctx)
 
-    _extension = AgenticExtension(ctx, handler_ctx)
-    ctx.AddCaptureViewer(_extension)
+    try:
+        _extension     = AgenticExtension(ctx, handler_ctx)
+        _extension_ctx = ctx
+        ctx.AddCaptureViewer(_extension)
 
-    _server = BridgeServer(handler_ctx)
-    _server.start()
+        _server = BridgeServer(handler_ctx)
+        _server.start()
 
-    if _server.port is not None:
-        handler_ctx._server_port = _server.port
+        if _server.port is not None:
+            handler_ctx._server_port = _server.port
 
-    handler_ctx._bridge = _server
+        handler_ctx._bridge = _server
+    except Exception:
+        _teardown()
+        raise
 
 
 def unregister() -> None:
     """Called by RenderDoc when the extension is unloaded."""
-    global _extension, _server
-
     print("[Agentic] Unregistering")
-
-    if _server is not None:
-        _server.stop()
-        _server = None
-
-    _extension = None
+    _teardown()
