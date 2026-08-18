@@ -24,6 +24,141 @@ from .handlers import HANDLERS
 from .          import winsock
 
 BUFFER_SIZE = 65536
+MAX_REQUEST_BYTES = 8 * 1024 * 1024
+REQUEST_IDLE_TIMEOUT_SECONDS = 5.0
+MAX_ACTIVE_CONNECTIONS = 4
+
+
+def protocol_error(error_code: str, message: str) -> Dict[str, Any]:
+    """Build a backwards-compatible structured protocol error response."""
+    return {
+        "ok": False,
+        "error": message,
+        "error_code": error_code,
+    }
+
+
+class FrameResult:
+    """One complete request or protocol error emitted by RequestFramer."""
+
+    def __init__(
+        self,
+        request: Optional[Dict[str, Any]] = None,
+        response: Optional[Dict[str, Any]] = None,
+        close: bool = False,
+    ) -> None:
+        self.request = request
+        self.response = response
+        self.close = close
+
+
+class RequestFramer:
+    """Bounded state machine for newline-delimited JSON object requests.
+
+    ``max_request_bytes`` includes the terminating newline. Bytes are examined
+    before they are copied into the retained buffer, so the buffer never grows
+    to the configured limit unless the next byte can validly be a newline.
+    """
+
+    def __init__(self, max_request_bytes: int = MAX_REQUEST_BYTES) -> None:
+        if max_request_bytes < 1:
+            raise ValueError("max_request_bytes must be positive")
+        self._max_request_bytes = max_request_bytes
+        self._buffer = bytearray()
+        self._fatal = False
+
+    @property
+    def buffered_bytes(self) -> int:
+        return len(self._buffer)
+
+    def feed(self, data: bytes) -> list:
+        """Consume bytes and return zero or more FrameResult instances."""
+        if self._fatal or not data:
+            return []
+
+        results = []
+        offset = 0
+
+        while offset < len(data):
+            newline = data.find(b"\n", offset)
+
+            if newline < 0:
+                remaining = len(data) - offset
+                # The line still needs a trailing newline, which is included
+                # in the request-size limit.
+                if len(self._buffer) + remaining >= self._max_request_bytes:
+                    results.append(self._fatal_result(
+                        "request_too_large",
+                        "request exceeds the maximum size of %d bytes"
+                        % self._max_request_bytes,
+                    ))
+                    break
+                self._buffer.extend(data[offset:])
+                break
+
+            segment_length = newline - offset + 1
+            if len(self._buffer) + segment_length > self._max_request_bytes:
+                results.append(self._fatal_result(
+                    "request_too_large",
+                    "request exceeds the maximum size of %d bytes"
+                    % self._max_request_bytes,
+                ))
+                break
+
+            self._buffer.extend(data[offset:newline])
+            line = bytes(self._buffer)
+            self._buffer.clear()
+            results.append(self._parse_line(line))
+            offset = newline + 1
+
+        return results
+
+    def finish(self) -> list:
+        """Finish the stream, reporting a buffered partial request as fatal."""
+        if self._fatal or not self._buffer:
+            return []
+
+        return [self._fatal_result(
+            "incomplete_request",
+            "connection closed before the request newline was received",
+        )]
+
+    def fatal_error(self, error_code: str, message: str) -> FrameResult:
+        """Discard retained input and emit a fatal backend-generated error."""
+        return self._fatal_result(error_code, message)
+
+    def _fatal_result(self, error_code: str, message: str) -> FrameResult:
+        self._buffer.clear()
+        self._fatal = True
+        return FrameResult(
+            response=protocol_error(error_code, message),
+            close=True,
+        )
+
+    def _parse_line(self, line: bytes) -> FrameResult:
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            return FrameResult(response=protocol_error(
+                "invalid_utf8",
+                "invalid request: line is not valid UTF-8",
+            ))
+
+        try:
+            request = json.loads(text)
+        except (TypeError, ValueError):
+            return FrameResult(response=protocol_error(
+                "invalid_json",
+                "invalid request: line is not valid JSON",
+            ))
+
+        if not isinstance(request, dict):
+            return FrameResult(response=protocol_error(
+                "request_not_object",
+                "invalid request: top-level JSON value must be an object",
+            ))
+
+        return FrameResult(request=request)
 
 
 # --- Qt bindings discovery ---
@@ -31,7 +166,7 @@ BUFFER_SIZE = 65536
 def _try_import_qt():
     """Import the first available Qt-Network binding.
 
-    Returns (QTcpServer, QTcpSocket, QHostAddress) or None.
+    Returns (QTcpServer, QTcpSocket, QHostAddress, QTimer) or None.
 
     Importing Qt for the first time pulls in libQt6Core, libQt6Network,
     etc., which transitively makes the Vulkan loader register
@@ -44,7 +179,8 @@ def _try_import_qt():
     for mod in ("PyQt6", "PySide6", "PySide2", "PyQt5"):
         try:
             net = __import__(f"{mod}.QtNetwork", fromlist=["QTcpServer"])
-            return (net.QTcpServer, net.QTcpSocket, net.QHostAddress)
+            core = __import__(f"{mod}.QtCore", fromlist=["QTimer"])
+            return (net.QTcpServer, net.QTcpSocket, net.QHostAddress, core.QTimer)
         except ImportError:
             continue
     return None
@@ -74,6 +210,14 @@ def _dispatch(ctx: Any, request: Dict[str, Any]) -> Dict[str, Any]:
 
 # --- Qt event-driven bridge ---
 
+class _QtConnectionState:
+    """Bounded input and idle timer owned by one Qt client socket."""
+
+    def __init__(self, framer: RequestFramer, timer: Any) -> None:
+        self.framer = framer
+        self.timer = timer
+
+
 class _QtBridge:
     """TCP server driven by Qt's event loop on the UI thread.
 
@@ -89,24 +233,21 @@ class _QtBridge:
         self._port_range = port_range
         self._port       : Optional[int]         = None
         self._server     : Any                = None
-        self._buffers    : Dict[Any, bytearray] = {}
+        self._timer_type : Any                = None
+        self._connections: Dict[Any, _QtConnectionState] = {}
 
     @property
     def port(self) -> Optional[int]:
         return self._port
 
     def start(self) -> None:
-        """Bind to the first free port in the range and start listening.
-
-        No anti-hijack handling needed: QTcpServer binds exclusively on
-        Windows, so listen() fails on an in-use port and a second instance
-        falls through to the next (the winsock path does this explicitly).
-        """
+        """Bind to the first available port and start listening."""
         qt = _try_import_qt()
         if qt is None:
             raise RuntimeError("_QtBridge.start called but no Qt binding available")
-        QTcpServer, _QTcpSocket, QHostAddress = qt
+        QTcpServer, _QTcpSocket, QHostAddress, QTimer = qt
         server = QTcpServer()
+        self._timer_type = QTimer
 
         for port in self._port_range:
             if server.listen(QHostAddress("127.0.0.1"), port):
@@ -126,59 +267,123 @@ class _QtBridge:
             self._server.close()
             self._server = None
 
-        for sock in list(self._buffers.keys()):
+        for sock in list(self._connections.keys()):
             try:
                 sock.disconnectFromHost()
             except Exception:
                 pass
-        self._buffers.clear()
+        for state in self._connections.values():
+            state.timer.stop()
+        self._connections.clear()
         print("[Agentic] Server stopped")
 
     def _on_new_connection(self) -> None:
         """Accept every pending connection and wire up its slots."""
         while self._server and self._server.hasPendingConnections():
             sock = self._server.nextPendingConnection()
-            self._buffers[sock] = bytearray()
+
+            if len(self._connections) >= MAX_ACTIVE_CONNECTIONS:
+                self._write_response(sock, protocol_error(
+                    "server_busy",
+                    "server has reached the maximum of %d active connections"
+                    % MAX_ACTIVE_CONNECTIONS,
+                ))
+                try:
+                    sock.disconnected.connect(sock.deleteLater)
+                    sock.disconnectFromHost()
+                except Exception:
+                    pass
+                continue
+
+            sock.setReadBufferSize(MAX_REQUEST_BYTES)
+            timer = self._timer_type(sock)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda s=sock: self._on_request_timeout(s))
+            self._connections[sock] = _QtConnectionState(
+                RequestFramer(),
+                timer,
+            )
             sock.readyRead.connect(lambda s=sock: self._on_ready_read(s))
             sock.disconnected.connect(lambda s=sock: self._on_disconnected(s))
-            print(f"[Agentic] Connection accepted ({len(self._buffers)} active)")
+            print(f"[Agentic] Connection accepted ({len(self._connections)} active)")
 
     def _on_ready_read(self, sock: Any) -> None:
         """Drain newly-arrived bytes and dispatch every complete line."""
-        buf = self._buffers.get(sock)
-        if buf is None:
+        state = self._connections.get(sock)
+        if state is None:
             return
 
-        buf += bytes(sock.readAll())
+        data = bytes(sock.readAll())
+        if not data:
+            return
 
-        while True:
-            nl = buf.find(b"\n")
-            if nl < 0:
-                break
+        # QTcpSocket can return its entire bounded read buffer at once. Feed
+        # fixed-size pieces so a burst of tiny lines cannot create an
+        # arbitrarily large temporary FrameResult list.
+        for offset in range(0, len(data), BUFFER_SIZE):
+            for result in state.framer.feed(data[offset:offset + BUFFER_SIZE]):
+                if result.request is not None:
+                    self._write_response(sock, _dispatch(self._ctx, result.request))
+                elif result.response is not None:
+                    self._write_response(sock, result.response)
 
-            line = bytes(buf[:nl])
-            del buf[:nl + 1]
+                if result.close:
+                    self._close_connection(sock)
+                    return
 
-            try:
-                request = json.loads(line.decode("utf-8"))
-            except Exception as e:
-                traceback.print_exc()
-                response = {"ok": False, "error": f"invalid request: {e}"}
-            else:
-                response = _dispatch(self._ctx, request)
+        if state.framer.buffered_bytes:
+            state.timer.start(int(REQUEST_IDLE_TIMEOUT_SECONDS * 1000))
+        else:
+            state.timer.stop()
 
+    def _on_request_timeout(self, sock: Any) -> None:
+        """Reject a partial request after five seconds without new bytes."""
+        state = self._connections.get(sock)
+        if state is None or not state.framer.buffered_bytes:
+            return
+
+        result = state.framer.fatal_error(
+            "request_timeout",
+            "request did not receive a newline within %.1f seconds"
+            % REQUEST_IDLE_TIMEOUT_SECONDS,
+        )
+        self._write_response(sock, result.response)
+        self._close_connection(sock)
+
+    @staticmethod
+    def _write_response(sock: Any, response: Dict[str, Any]) -> None:
+        """Attempt to serialize and flush one response to a Qt socket."""
+        try:
             out = (json.dumps(response, separators=(",", ":")) + "\n").encode("utf-8")
             sock.write(out)
             sock.flush()
+        except Exception:
+            traceback.print_exc()
+
+    def _close_connection(self, sock: Any) -> None:
+        """Release tracked state and ask Qt to close the client socket."""
+        state = self._connections.pop(sock, None)
+        if state is not None:
+            state.timer.stop()
+        try:
+            sock.disconnectFromHost()
+        except Exception:
+            pass
 
     def _on_disconnected(self, sock: Any) -> None:
         """Forget the socket and schedule it for deletion."""
-        self._buffers.pop(sock, None)
+        state = self._connections.get(sock)
+        if state is not None:
+            for result in state.framer.finish():
+                if result.response is not None:
+                    self._write_response(sock, result.response)
+            state.timer.stop()
+            self._connections.pop(sock, None)
         try:
             sock.deleteLater()
         except Exception:
             pass
-        print(f"[Agentic] Connection closed ({len(self._buffers)} active)")
+        print(f"[Agentic] Connection closed ({len(self._connections)} active)")
 
 
 # --- Threaded fallback ---
@@ -187,22 +392,36 @@ class JsonSocket:
     """JSON-lines protocol over a raw winsock connection."""
 
     def __init__(self, conn: Any) -> None:
-        self._conn   = conn
-        self._buffer = b""
+        self._conn = conn
+        self._framer = RequestFramer()
+        self._pending = []
 
-    def read_request(self) -> Optional[Dict[str, Any]]:
-        """Read one newline-delimited JSON request. Blocks."""
-        while b"\n" not in self._buffer:
+    def read_result(self) -> Optional[FrameResult]:
+        """Read one framed request or protocol error. Blocks."""
+        while True:
+            if self._pending:
+                return self._pending.pop(0)
+
             try:
                 data = self._conn.recv(BUFFER_SIZE)
-                if not data:
-                    return None
-                self._buffer += data
-            except (winsock.SocketError, OSError):
+            except (winsock.SocketError, OSError) as error:
+                if winsock.is_timeout_error(error):
+                    if not self._framer.buffered_bytes:
+                        continue
+                    return self._framer.fatal_error(
+                        "request_timeout",
+                        "request did not receive a newline within %.1f seconds"
+                        % REQUEST_IDLE_TIMEOUT_SECONDS,
+                    )
                 return None
 
-        line, self._buffer = self._buffer.split(b"\n", 1)
-        return json.loads(line.decode("utf-8"))
+            if not data:
+                self._pending.extend(self._framer.finish())
+                if self._pending:
+                    return self._pending.pop(0)
+                return None
+
+            self._pending.extend(self._framer.feed(data))
 
     def write_response(self, response: Dict[str, Any]) -> None:
         """Write a JSON response followed by a newline."""
@@ -236,9 +455,10 @@ class _ThreadedBridge:
         for port in self._port_range:
             try:
                 self._server_socket = winsock.Socket()
-                # Exclusive bind: on Windows SO_REUSEADDR lets a 2nd instance
-                # share an in-use port, collapsing every GUI onto 19876.
-                self._server_socket.setsockopt_exclusive()
+                # POSIX enables SO_REUSEADDR for prompt rebinding. Windows
+                # uses SO_EXCLUSIVEADDRUSE so a live GUI and worker cannot
+                # become competing listeners on the same port.
+                self._server_socket.configure_server_bind()
                 self._server_socket.bind("127.0.0.1", port)
                 self._server_socket.listen(5)
                 self._port = port
@@ -284,13 +504,39 @@ class _ThreadedBridge:
                 conn = self._server_socket.accept()
 
                 with self._conn_lock:
-                    self._active_conns += 1
-                    count = self._active_conns
+                    if self._active_conns >= MAX_ACTIVE_CONNECTIONS:
+                        count = None
+                    else:
+                        self._active_conns += 1
+                        count = self._active_conns
+
+                if count is None:
+                    try:
+                        try:
+                            JsonSocket(conn).write_response(protocol_error(
+                                "server_busy",
+                                "server has reached the maximum of %d active connections"
+                                % MAX_ACTIVE_CONNECTIONS,
+                            ))
+                        except (winsock.SocketError, OSError):
+                            pass
+                    finally:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    continue
 
                 print(f"[Agentic] Connection accepted ({count} active)")
 
                 # See module docstring re: Python 3.14 threading bug.
-                _thread.start_new_thread(self._handle_connection, (conn,))
+                try:
+                    _thread.start_new_thread(self._handle_connection, (conn,))
+                except Exception:
+                    conn.close()
+                    with self._conn_lock:
+                        self._active_conns -= 1
+                    traceback.print_exc()
             except (winsock.SocketError, OSError):
                 if self._running:
                     traceback.print_exc()
@@ -300,14 +546,21 @@ class _ThreadedBridge:
         js = JsonSocket(sock)
 
         try:
+            sock.settimeout(REQUEST_IDLE_TIMEOUT_SECONDS)
             while self._running:
-                request = js.read_request()
-                if request is None:
+                result = js.read_result()
+                if result is None:
                     break
 
-                with self._dispatch_lock:
-                    response = _dispatch(self._ctx, request)
-                js.write_response(response)
+                if result.request is not None:
+                    with self._dispatch_lock:
+                        response = _dispatch(self._ctx, result.request)
+                    js.write_response(response)
+                elif result.response is not None:
+                    js.write_response(result.response)
+
+                if result.close:
+                    break
         except Exception:
             traceback.print_exc()
         finally:

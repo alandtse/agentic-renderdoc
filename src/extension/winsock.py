@@ -41,14 +41,9 @@ if sys.platform != "win32":
             else:
                 self._sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
 
-        def setsockopt_reuse(self):
-            """Enable SO_REUSEADDR so the port can be rebound immediately."""
+        def configure_server_bind(self):
+            """Allow prompt port reuse after a prior listener exits."""
             self._sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-
-        def setsockopt_exclusive(self):
-            """Exclusive bind. POSIX refuses a second live bind anyway, so
-            SO_REUSEADDR (TIME_WAIT reuse only) is harmless here."""
-            self.setsockopt_reuse()
 
         def bind(self, host: str, port: int):
             """Bind to the given address and port."""
@@ -67,6 +62,10 @@ if sys.platform != "win32":
             """Receive up to bufsize bytes."""
             return self._sock.recv(bufsize)
 
+        def settimeout(self, seconds):
+            """Set the blocking receive timeout in seconds."""
+            self._sock.settimeout(seconds)
+
         def sendall(self, data: bytes):
             """Send all of data, looping until every byte is written."""
             self._sock.sendall(data)
@@ -80,6 +79,10 @@ if sys.platform != "win32":
 
         def __exit__(self, *args):
             self.close()
+
+    def is_timeout_error(error):
+        """Return whether *error* represents a socket receive timeout."""
+        return isinstance(error, _socket.timeout)
 
 # Early exit -- everything below is Windows-only.
 else:
@@ -99,8 +102,9 @@ else:
     SOCK_STREAM     = 1
     IPPROTO_TCP     = 6
     SOL_SOCKET      = 0xFFFF
-    SO_REUSEADDR    = 4
-    SO_EXCLUSIVEADDRUSE = -5  # ~SO_REUSEADDR; bind() fails if the port is in use.
+    SO_EXCLUSIVEADDRUSE = -5
+    SO_RCVTIMEO     = 0x1006
+    WSAETIMEDOUT    = 10060
     INVALID_SOCKET  = ~0 & 0xFFFFFFFFFFFFFFFF
     SOCKET_ERROR    = -1
     INADDR_LOOPBACK = 0x7F000001  # 127.0.0.1; needs htonl before use.
@@ -240,25 +244,22 @@ else:
                 if self._handle == INVALID_SOCKET:
                     raise SocketError("socket")
 
-        def _setsockopt_bool(self, optname):
-            """Set a boolean (int=1) SOL_SOCKET option, raising on failure."""
+        def configure_server_bind(self):
+            """Prevent another Windows listener from sharing this port.
+
+            Windows ``SO_REUSEADDR`` permits multiple listeners to bind the
+            same address, which can route a worker probe to an existing live
+            GUI. ``SO_EXCLUSIVEADDRUSE`` makes the actual bridge bind the
+            authoritative port-ownership check.
+            """
             val    = ctypes.c_int(1)
             result = ws2_32.setsockopt(
-                self._handle, SOL_SOCKET, optname,
+                self._handle, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                 ctypes.cast(ctypes.byref(val), ctypes.c_char_p),
                 ctypes.sizeof(val),
             )
             if result == SOCKET_ERROR:
                 raise SocketError("setsockopt")
-
-        def setsockopt_reuse(self):
-            """Enable SO_REUSEADDR so the port can be rebound immediately."""
-            self._setsockopt_bool(SO_REUSEADDR)
-
-        def setsockopt_exclusive(self):
-            """SO_EXCLUSIVEADDRUSE: make bind() fail on an in-use port (vs the
-            SO_REUSEADDR hijack) so the port-range loop advances to a free one."""
-            self._setsockopt_bool(SO_EXCLUSIVEADDRUSE)
 
         def bind(self, host: str, port: int):
             """Bind to the given address and port.
@@ -322,6 +323,31 @@ else:
                 return b""
             return buf.raw[:result]
 
+        def settimeout(self, seconds):
+            """Set the blocking receive timeout in seconds.
+
+            ``SO_RCVTIMEO`` takes a DWORD millisecond value on Windows. A
+            value of zero restores blocking mode, matching stdlib socket's
+            ``settimeout(None)`` behaviour.
+            """
+            if seconds is None:
+                milliseconds = 0
+            else:
+                if seconds < 0:
+                    raise ValueError("timeout must be non-negative")
+                milliseconds = int(seconds * 1000)
+                if seconds > 0 and milliseconds == 0:
+                    milliseconds = 1
+
+            value = wintypes.DWORD(milliseconds)
+            result = ws2_32.setsockopt(
+                self._handle, SOL_SOCKET, SO_RCVTIMEO,
+                ctypes.cast(ctypes.byref(value), ctypes.c_char_p),
+                ctypes.sizeof(value),
+            )
+            if result == SOCKET_ERROR:
+                raise SocketError("setsockopt")
+
         def sendall(self, data: bytes):
             """Send all of ``data``, looping until every byte is written.
 
@@ -346,3 +372,8 @@ else:
 
         def __exit__(self, *args):
             self.close()
+
+
+    def is_timeout_error(error):
+        """Return whether *error* represents ``WSAETIMEDOUT``."""
+        return getattr(error, "wsa_error", None) == WSAETIMEDOUT
