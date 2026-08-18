@@ -1726,14 +1726,24 @@ def make_view_texture(ctx: Any) -> Callable[..., dict]:
         if getattr(ctx, "headless", False):
             return _headless_no_ui()
 
+        selected = [None]
+
         def _view() -> None:
             pyrenderdoc = ctx.ctx
-            if hasattr(pyrenderdoc, "ViewTextureDisplay"):
-                pyrenderdoc.ViewTextureDisplay(resource_id)
-            elif hasattr(pyrenderdoc, "ShowTextureViewer"):
-                pyrenderdoc.ShowTextureViewer()
+            viewer = pyrenderdoc.GetTextureViewer()
+            viewer.ViewTexture(resource_id, rd.CompType.Typeless, True)
+            selected[0] = viewer.GetCurrentResource()
 
         ctx.invoke_ui(_view)
+
+        if selected[0] != resource_id:
+            return {
+                "ok"                 : False,
+                "error"              : "texture viewer selected a different resource",
+                "requested_resource" : str(resource_id),
+                "current_resource"   : str(selected[0]),
+            }
+
         return {"viewing_texture": True}
 
     return view_texture
