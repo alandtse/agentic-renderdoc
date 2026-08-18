@@ -114,6 +114,14 @@ def eval(code: str, instance: str | None = None,
     and debugging. Code runs inside RenderDoc's embedded Python interpreter
     with full access to the replay engine.
 
+    Everything below assumes a capture already exists (loaded or freshly
+    triggered). If you need to launch an application under RenderDoc and
+    get a fresh capture from it, that's a process-lifecycle operation, not
+    a replay one — use ``Instance(action="launch")`` to start it and get a
+    target ident, then ``Instance(action="trigger_capture")`` to capture a
+    frame. Eval's replay APIs (``ctx.replay``, ``SetFrameEvent``, etc.
+    below) only apply once a capture is loaded for inspection.
+
     WHEN TO REACH FOR RENDERDOC (vs Tracy)
     ======================================
     If a Tracy MCP is also available (``mcp__tracy__*``), the two tools
@@ -1293,6 +1301,10 @@ def instance(
     frame_number       : int | None = None,
     wait_secs          : float      = 10.0,
     host               : str | None = None,
+    app                : str | None = None,
+    working_dir        : str | None = None,
+    cmd_line           : str | None = None,
+    hook_into_children : bool       = True,
     match              : str | None = None,
     async_mode         : bool       = False,
     timeout            : float | None = None,
@@ -1372,6 +1384,26 @@ def instance(
                                  poll with the Task tool), and ``timeout=``
                                  to set the per-step replay deadline
                                  (default 120s).
+             - ``launch``      : Start a fresh application under RenderDoc's
+                                 capture layer, so it can then be found via
+                                 ``targets`` and captured via
+                                 ``trigger_capture`` — this is how a target
+                                 gets hooked in the first place (``targets``
+                                 only lists processes that already have the
+                                 layer loaded). Requires ``app`` (exe path).
+                                 Waits up to ``wait_secs`` (default 30, max
+                                 120) for a target to register and returns
+                                 it directly (same shape as one ``targets``
+                                 entry, plus ``launch_ident``) — pass its
+                                 ``ident`` straight into
+                                 ``trigger_capture``. If ``app`` is a
+                                 loader/launcher that spawns the real
+                                 target as a child process and exits (many
+                                 Steam/mod-manager loaders do this), leave
+                                 ``hook_into_children`` at its default
+                                 (True) and set ``match`` to a substring of
+                                 the real target's exe name so the right
+                                 process is picked out.
              - ``targets``     : Enumerate running processes that have
                                  the RenderDoc capture layer loaded
                                  (e.g. skyrim.exe, the editor, …).
@@ -1379,11 +1411,13 @@ def instance(
                                  PID, and current API. These are not the
                                  same thing as analyzer instances —
                                  they're the live programs you'd ask
-                                 to take a frame capture. Pass ``match``
-                                 (exe-name substring) to filter, and
-                                 ``wait_secs`` to poll until a matching
-                                 target appears — e.g. after injecting a
-                                 game, to skip sibling helper processes.
+                                 to take a frame capture. Use ``launch``
+                                 first if nothing is hooked yet. Pass
+                                 ``match`` (exe-name substring) to filter,
+                                 and ``wait_secs`` to poll until a
+                                 matching target appears — e.g. after
+                                 injecting a game, to skip sibling helper
+                                 processes.
              - ``trigger_capture``:
                                  Tell a running target to capture
                                  ``num_frames`` (default 1) sequential
@@ -1432,6 +1466,15 @@ def instance(
     bind_wait : open only — seconds to wait for the headless worker to
                 bind its bridge and finish loading the capture (default
                 30). Raise it for large captures that load slowly.
+    app                : launch only — path to the executable to run.
+    working_dir        : launch only — working directory (default: the
+                         app's own directory).
+    cmd_line           : launch only — command line arguments.
+    hook_into_children : launch only — also hook child processes
+                         (default True; see the ``launch`` action above).
+    match              : launch only — substring to match against the
+                         registered target's exe name, for when
+                         hook_into_children finds more than one candidate.
 
     Capture discovery directories for ``discover`` default to
     ``/tmp/RenderDoc`` (Linux) or ``%TEMP%\\RenderDoc`` (Windows). Add
@@ -1556,6 +1599,34 @@ def instance(
             return _find_first_divergence(
                 instance_a, instance_b, eid_start, eid_end, step_timeout,
             )
+        except (ConnectionError, KeyError) as e:
+            return {"ok": False, "error": str(e)}
+
+    if action == "launch":
+        if not app:
+            return {
+                "ok"    : False,
+                "error" : "launch requires app= (path to the executable to run)",
+            }
+        if not _pool.aliases:
+            try:
+                _pool.ensure_connected()
+            except ConnectionError as e:
+                return {"ok": False, "error": str(e)}
+        params: dict = {"app": app, "hook_into_children": bool(hook_into_children)}
+        if working_dir is not None:
+            params["working_dir"] = working_dir
+        if cmd_line is not None:
+            params["cmd_line"] = cmd_line
+        if match is not None:
+            params["match"] = match
+        params["wait_secs"] = float(wait_secs)
+        try:
+            # Read deadline a hair beyond the handler's own wait_secs so we
+            # don't time the socket out before the handler returns.
+            read_timeout = max(30.0, float(wait_secs) + 15.0)
+            return _pool.send("target_launch", params, alias=alias,
+                              read_timeout=read_timeout)
         except (ConnectionError, KeyError) as e:
             return {"ok": False, "error": str(e)}
 

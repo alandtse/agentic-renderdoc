@@ -578,15 +578,75 @@ def handle_capture_list(ctx: Any, params: Dict[str, Any]) -> Dict[str, Any]:
         },
     },
 )
+def _enumerate_targets(host):
+    # type: (str) -> tuple
+    """Probe every ident EnumerateRemoteTargets reports, return (targets, error_str).
+
+    Shared by targets_list and target_launch so both see the same
+    ident/target/api/pid shape and the same probe behavior (each probe
+    Shutdown()s before moving on so we don't keep a target busy). Hard
+    cap of 64 probes — pathological hosts can otherwise spin.
+    """
+    import renderdoc as rd
+
+    client_name = "agentic-renderdoc"
+    targets = []
+    next_ident = 0
+    for _ in range(64):
+        try:
+            next_ident = rd.EnumerateRemoteTargets(host, next_ident)
+        except Exception as e:
+            return None, "EnumerateRemoteTargets failed: {}".format(e)
+        if not next_ident:
+            break
+
+        probe = None
+        info = {"ident": int(next_ident)}
+        try:
+            probe = rd.CreateTargetControl(host, int(next_ident),
+                                           client_name, False)
+            if probe is not None:
+                try:
+                    info["target"]      = str(probe.GetTarget())
+                except Exception:
+                    pass
+                try:
+                    info["api"]         = str(probe.GetAPI())
+                except Exception:
+                    pass
+                try:
+                    info["pid"]         = int(probe.GetPID())
+                except Exception:
+                    pass
+                try:
+                    busy = str(probe.GetBusyClient())
+                    if busy:
+                        info["busy_client"] = busy
+                except Exception:
+                    pass
+        except Exception as e:
+            info["probe_error"] = str(e)
+        finally:
+            if probe is not None:
+                try:
+                    probe.Shutdown()
+                except Exception:
+                    pass
+
+        targets.append(info)
+    return targets, None
+
+
+def _filter_targets(targets, match):
+    # type: (List[Dict[str, Any]], str) -> List[Dict[str, Any]]
+    """Case-insensitive substring filter on each target's reported name."""
+    m = (match or "").lower()
+    return [t for t in targets if m in str(t.get("target", "")).lower()]
+
+
 def handle_targets_list(ctx, params):
     # type: (Any, Dict[str, Any]) -> Dict[str, Any]
     """List live capture-control targets on the given host.
-
-    For each ident reported by EnumerateRemoteTargets, opens a quick
-    TargetControl connection to read the executable name, PID, API,
-    and busy-client (if another tool already has the connection
-    open). Each probe Shutdown()s before moving on so we don't keep
-    the target busy.
 
     Pass ``match`` to filter targets by executable-name substring
     (case-insensitive), and ``wait_secs`` to poll until one appears —
@@ -594,74 +654,19 @@ def handle_targets_list(ctx, params):
     moment to register a target and whose process is otherwise hard to
     tell from sibling helpers (e.g. SteamVR's).
     """
-    import renderdoc as rd
     import time
 
-    host        = params.get("host") or ""
-    match       = params.get("match")
-    wait_secs   = params.get("wait_secs")
-    client_name = "agentic-renderdoc"
-
-    def _enumerate():
-        # Returns (targets, error_str). Hard cap on probes — pathological
-        # hosts can otherwise spin.
-        targets = []
-        next_ident = 0
-        for _ in range(64):
-            try:
-                next_ident = rd.EnumerateRemoteTargets(host, next_ident)
-            except Exception as e:
-                return None, "EnumerateRemoteTargets failed: {}".format(e)
-            if not next_ident:
-                break
-
-            probe = None
-            info = {"ident": int(next_ident)}
-            try:
-                probe = rd.CreateTargetControl(host, int(next_ident),
-                                               client_name, False)
-                if probe is not None:
-                    try:
-                        info["target"]      = str(probe.GetTarget())
-                    except Exception:
-                        pass
-                    try:
-                        info["api"]         = str(probe.GetAPI())
-                    except Exception:
-                        pass
-                    try:
-                        info["pid"]         = int(probe.GetPID())
-                    except Exception:
-                        pass
-                    try:
-                        busy = str(probe.GetBusyClient())
-                        if busy:
-                            info["busy_client"] = busy
-                    except Exception:
-                        pass
-            except Exception as e:
-                info["probe_error"] = str(e)
-            finally:
-                if probe is not None:
-                    try:
-                        probe.Shutdown()
-                    except Exception:
-                        pass
-
-            targets.append(info)
-        return targets, None
-
-    def _matching(targets):
-        m = (match or "").lower()
-        return [t for t in targets if m in str(t.get("target", "")).lower()]
+    host      = params.get("host") or ""
+    match     = params.get("match")
+    wait_secs = params.get("wait_secs")
 
     # Only poll when both a name to wait for and a budget are given.
     deadline = (time.time() + float(wait_secs)) if (match and wait_secs) else None
     while True:
-        targets, err = _enumerate()
+        targets, err = _enumerate_targets(host)
         if err is not None:
             return {"ok": False, "error": err}
-        matched = _matching(targets) if match else []
+        matched = _filter_targets(targets, match) if match else []
         if matched or deadline is None or time.time() >= deadline:
             break
         time.sleep(0.5)
@@ -833,6 +838,115 @@ def handle_target_trigger_capture(ctx, params):
             control.Shutdown()
         except Exception:
             pass
+
+
+@handler(
+    "target_launch",
+    description="Launch an application under RenderDoc's capture layer and wait for it to register as a target.",
+    schema={
+        "properties": {
+            "app"                : {"type": "string", "description": "Path to the executable to launch. Required."},
+            "working_dir"        : {"type": "string", "description": "Working directory. Empty = the app's own directory."},
+            "cmd_line"           : {"type": "string", "description": "Command line arguments."},
+            "hook_into_children" : {"type": "boolean", "description": "Also hook processes the app spawns. Needed when app is a loader that launches the real target as a child and exits (common for Steam/mod-manager loaders). Default True: the common case, and being False when it was needed silently loses the target."},
+            "match"              : {"type": "string", "description": "Substring (case-insensitive) to match against the registered target's executable name. Use when hook_into_children is set and the child's name differs from app, so the right one is picked out of several. If omitted, the first newly-registered target is used."},
+            "wait_secs"          : {"type": "number", "description": "How long to poll for a matching target to register. Default 30s, capped at 120s."},
+        },
+        "required": ["app"],
+    },
+)
+def handle_target_launch(ctx, params):
+    # type: (Any, Dict[str, Any]) -> Dict[str, Any]
+    """Launch `app` under RenderDoc and wait for a target to register.
+
+    Sequence:
+      1. rd.ExecuteAndInject(app, working_dir, cmd_line, [], "", opts, False)
+         with opts.hookIntoChildren = hook_into_children.
+      2. Poll the same _enumerate_targets/_filter_targets helpers
+         targets_list uses, for up to wait_secs, watching for an ident
+         not present before the launch. This covers both the direct
+         case (the launched exe is the real target) and the loader
+         case (a distinct child ident appears after the loader's own
+         ident, which may already have exited).
+      3. If match is set, only accept a newly-seen target whose name
+         contains it (case-insensitive). Otherwise accept the first
+         newly-seen ident, preferring launch_ident itself if it's
+         among them.
+
+    Returns the same ident/target/api/pid shape as targets_list's
+    entries (plus launch_ident, the ident ExecuteAndInject itself
+    returned, for reference), ready to hand straight to
+    Instance(action='trigger_capture').
+    """
+    import time
+    import renderdoc as rd
+
+    app = params.get("app")
+    if not app:
+        return {"ok": False, "error": "app is required"}
+
+    working_dir = params.get("working_dir") or ""
+    cmd_line = params.get("cmd_line") or ""
+    hook_into_children = bool(params.get("hook_into_children", True))
+    match = params.get("match")
+    wait_secs = max(1.0, min(120.0, float(params.get("wait_secs", 30.0))))
+
+    opts = rd.CaptureOptions()
+    opts.hookIntoChildren = hook_into_children
+
+    # Baseline: idents already registered before we launch anything, so we
+    # can tell a pre-existing target apart from one this launch created.
+    before_targets, err = _enumerate_targets("")
+    before_idents = set(t["ident"] for t in before_targets) if err is None else set()
+
+    try:
+        # env must be [] not None -- see concept:executeandinject_env_none_crashes,
+        # None hard-crashes qrenderdoc.exe (null deref in the SWIG rdcarray binding)
+        # rather than raising a catchable Python exception.
+        result = rd.ExecuteAndInject(app, working_dir, cmd_line, [], "", opts, False)
+    except Exception as e:
+        return {"ok": False, "error": "ExecuteAndInject failed: {}".format(e)}
+
+    if not result.result.OK():
+        return {"ok": False, "error": "launch failed: {}".format(result.result.Message())}
+
+    launch_ident = int(result.ident)
+
+    start = time.time()
+    deadline = start + wait_secs
+    best = None
+
+    while time.time() < deadline and best is None:
+        targets, err = _enumerate_targets("")
+        if err is not None:
+            return {"ok": False, "error": err}
+
+        candidates = [t for t in targets if t["ident"] not in before_idents]
+        if match:
+            candidates = _filter_targets(candidates, match)
+
+        if candidates:
+            # Prefer the ident ExecuteAndInject itself reported, if it's
+            # one of the new candidates; otherwise take the first.
+            best = next((t for t in candidates if t["ident"] == launch_ident),
+                        candidates[0])
+            break
+
+        time.sleep(0.5)
+
+    if best is None:
+        return {
+            "ok"    : False,
+            "error" : "no {}target registered within {}s (launch ident was {}); "
+                      "the app may be slow to start, may not have created a D3D/Vulkan "
+                      "device yet, or hook_into_children may need to be toggled".format(
+                          "matching " if match else "", wait_secs, launch_ident),
+            "data"  : {"launch_ident": launch_ident},
+        }
+
+    best["launch_ident"] = launch_ident
+    best["waited_secs"] = round(time.time() - start, 2)
+    return {"ok": True, "data": best}
 
 
 # --- reload (dev only) ---

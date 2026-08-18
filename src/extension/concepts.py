@@ -287,6 +287,32 @@ Pass ``force=True`` to steal the target-control channel from any
 RenderDoc UI that's currently attached to the target.
 """,
     },
+    {
+        "name"      : "concept:executeandinject_env_none_crashes",
+        "kind"      : "concept",
+        "signature" : "rd.ExecuteAndInject(exe, workingDir, cmdLine, env, opts, ...)",
+        "doc"       : """\
+CRASHES qrenderdoc.exe if ``env`` is None. RenderDoc's SWIG rdcarray
+binding (TypeConversion<rdcarray<U>>::ConvertFromPy) treats Py_None as
+a valid pointer conversion that resolves to NULL, then unconditionally
+dereferences it (``out = *ptr``) — a null-pointer read, not a Python
+exception. The GUI hard-crashes (access violation), it does not raise.
+
+Always pass an empty list, never None/omitted-as-None:
+
+    rd.ExecuteAndInject(exe, workingDir, cmdLine, [], capture_options, opts)
+
+Same trap applies to any other rdcarray-typed parameter across the API
+(e.g. capture_options-adjacent list args) — None silently "succeeds"
+the pointer conversion and then segfaults on first use. When relaunching
+an already-running game under injection (rd.InjectIntoProcess(pid)
+returns ident 0 with no target if the process already created its
+device), use ExecuteAndInject instead, then poll
+Instance(action="targets", match=..., wait_secs=...) for the real
+target — the returned ident is often a sibling helper process, not the
+game itself.
+""",
+    },
 
     # --- Large captures ---
     {
