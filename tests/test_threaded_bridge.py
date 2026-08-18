@@ -4,7 +4,12 @@ import json
 import socket
 import sys
 
+import pytest
+
 from extension import bridge
+
+
+AUTH_TOKEN = "a" * 64
 
 
 class FakeSocket:
@@ -104,7 +109,11 @@ def _responses(sock):
 
 
 def _run_connection(sock, monkeypatch, dispatch=None):
-    threaded = bridge._ThreadedBridge(object(), range(19876, 19877))
+    threaded = bridge._ThreadedBridge(
+        object(),
+        range(19876, 19877),
+        auth_token=AUTH_TOKEN,
+    )
     threaded._running = True
     threaded._active_conns = 1
     if dispatch is not None:
@@ -125,7 +134,8 @@ def test_threaded_timeout_after_partial_request_is_deterministic(monkeypatch):
 
 
 def test_threaded_timeout_without_partial_request_keeps_waiting(monkeypatch):
-    sock = FakeSocket([_timeout_error(), b'{"cmd":"eval"}\n', b""])
+    request = json.dumps({"auth": AUTH_TOKEN, "cmd": "eval"}).encode("utf-8") + b"\n"
+    sock = FakeSocket([_timeout_error(), request, b""])
     monkeypatch.setattr(
         bridge,
         "_dispatch",
@@ -163,7 +173,11 @@ def test_threaded_oversized_request_reports_error_and_closes(monkeypatch):
 
 def test_threaded_rejects_connection_above_active_limit(monkeypatch):
     extra = FakeSocket()
-    threaded = bridge._ThreadedBridge(object(), range(19876, 19877))
+    threaded = bridge._ThreadedBridge(
+        object(),
+        range(19876, 19877),
+        auth_token=AUTH_TOKEN,
+    )
     threaded._running = True
     threaded._active_conns = bridge.MAX_ACTIVE_CONNECTIONS
 
@@ -190,8 +204,13 @@ def test_threaded_rejects_connection_above_active_limit(monkeypatch):
 
 def test_large_eval_and_texture_requests_still_dispatch(monkeypatch):
     code = "x" * (1024 * 1024)
-    eval_request = {"cmd": "eval", "params": {"code": code}}
+    eval_request = {
+        "auth": AUTH_TOKEN,
+        "cmd": "eval",
+        "params": {"code": code},
+    }
     texture_request = {
+        "auth": AUTH_TOKEN,
         "cmd": "get_texture",
         "params": {"resource_id": "ResourceId::1", "mip": 0},
     }
@@ -219,14 +238,26 @@ def test_large_eval_and_texture_requests_still_dispatch(monkeypatch):
 
 
 def test_qt_and_threaded_backends_emit_matching_protocol(monkeypatch):
-    payload = b'\xff\n{]\n[]\n{"cmd":"eval","params":{}}\n'
+    payload = (
+        b"\xff\n{]\n[]\n"
+        + json.dumps({
+            "auth": AUTH_TOKEN,
+            "cmd": "eval",
+            "params": {},
+        }).encode("utf-8")
+        + b"\n"
+    )
     dispatch = lambda _ctx, request: {"ok": True, "cmd": request["cmd"]}
     monkeypatch.setattr(bridge, "_dispatch", dispatch)
 
     threaded_sock = FakeSocket([payload, b""])
     _run_connection(threaded_sock, monkeypatch)
 
-    qt_backend = bridge._QtBridge(object(), range(19876, 19877))
+    qt_backend = bridge._QtBridge(
+        object(),
+        range(19876, 19877),
+        auth_token=AUTH_TOKEN,
+    )
     qt_sock = FakeQtSocket()
     qt_backend._server = FakeQtServer(qt_sock)
     qt_backend._timer_type = FakeQtTimer
@@ -241,3 +272,32 @@ def test_qt_and_threaded_backends_emit_matching_protocol(monkeypatch):
         "request_not_object",
         None,
     ]
+
+
+@pytest.mark.parametrize("auth", [None, "b" * 64])
+def test_threaded_rejects_unauthorized_request_before_dispatch(
+    monkeypatch,
+    auth,
+):
+    request = {"cmd": "eval", "params": {}}
+    if auth is not None:
+        request["auth"] = auth
+    sock = FakeSocket([
+        (json.dumps(request) + "\n").encode("utf-8"),
+        b"",
+    ])
+    dispatched = []
+
+    _run_connection(
+        sock,
+        monkeypatch,
+        lambda _ctx, value: dispatched.append(value),
+    )
+
+    assert _responses(sock) == [{
+        "ok": False,
+        "error": "unauthorized",
+        "error_code": "unauthorized",
+    }]
+    assert dispatched == []
+    assert sock.closed is True

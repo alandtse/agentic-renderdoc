@@ -16,10 +16,12 @@ Two implementations share a common dispatch:
                      when no Qt bindings are importable.
 """
 import _thread
+import hmac
 import json
 import threading
 import traceback
 from typing import Any, Dict, Optional
+from .          import credentials
 from .handlers import HANDLERS
 from .          import winsock
 
@@ -36,6 +38,22 @@ def protocol_error(error_code: str, message: str) -> Dict[str, Any]:
         "error": message,
         "error_code": error_code,
     }
+
+
+def _request_is_authorized(request: Dict[str, Any], auth_token: Any) -> bool:
+    """Validate a request token without exposing why authentication failed."""
+    supplied = request.get("auth")
+    if not isinstance(auth_token, str) or not isinstance(supplied, str):
+        return False
+    return hmac.compare_digest(supplied, auth_token)
+
+
+def _unauthorized_result():
+    """Build the common fatal response for missing and incorrect tokens."""
+    return FrameResult(
+        response=protocol_error("unauthorized", "unauthorized"),
+        close=True,
+    )
 
 
 class FrameResult:
@@ -228,9 +246,10 @@ class _QtBridge:
     No Python threads are created by this class.
     """
 
-    def __init__(self, ctx: Any, port_range: range) -> None:
+    def __init__(self, ctx: Any, port_range: range, auth_token: Any = None) -> None:
         self._ctx        = ctx
         self._port_range = port_range
+        self._auth_token = auth_token
         self._port       : Optional[int]         = None
         self._server     : Any                = None
         self._timer_type : Any                = None
@@ -240,8 +259,12 @@ class _QtBridge:
     def port(self) -> Optional[int]:
         return self._port
 
+    def set_auth_token(self, auth_token: Any) -> None:
+        self._auth_token = auth_token
+
     def start(self) -> None:
         """Bind to the first available port and start listening."""
+        self._port = None
         qt = _try_import_qt()
         if qt is None:
             raise RuntimeError("_QtBridge.start called but no Qt binding available")
@@ -323,6 +346,11 @@ class _QtBridge:
         for offset in range(0, len(data), BUFFER_SIZE):
             for result in state.framer.feed(data[offset:offset + BUFFER_SIZE]):
                 if result.request is not None:
+                    if not _request_is_authorized(result.request, self._auth_token):
+                        unauthorized = _unauthorized_result()
+                        self._write_response(sock, unauthorized.response)
+                        self._close_connection(sock)
+                        return
                     self._write_response(sock, _dispatch(self._ctx, result.request))
                 elif result.response is not None:
                     self._write_response(sock, result.response)
@@ -432,9 +460,10 @@ class JsonSocket:
 class _ThreadedBridge:
     """Socket + threads fallback. Racy on Python 3.14 -- see module docstring."""
 
-    def __init__(self, ctx: Any, port_range: range) -> None:
+    def __init__(self, ctx: Any, port_range: range, auth_token: Any = None) -> None:
         self._ctx           = ctx
         self._port_range    = port_range
+        self._auth_token    = auth_token
         self._port          : Optional[int]            = None
         self._server_socket : Any                   = None
         self._running       : bool                  = False
@@ -447,10 +476,14 @@ class _ThreadedBridge:
     def port(self) -> Optional[int]:
         return self._port
 
+    def set_auth_token(self, auth_token: Any) -> None:
+        self._auth_token = auth_token
+
     def start(self) -> None:
         if self._running:
             return
         self._running = True
+        self._port = None
 
         for port in self._port_range:
             try:
@@ -553,6 +586,10 @@ class _ThreadedBridge:
                     break
 
                 if result.request is not None:
+                    if not _request_is_authorized(result.request, self._auth_token):
+                        unauthorized = _unauthorized_result()
+                        js.write_response(unauthorized.response)
+                        break
                     with self._dispatch_lock:
                         response = _dispatch(self._ctx, result.request)
                     js.write_response(response)
@@ -589,6 +626,8 @@ class BridgeServer:
         port_range : range = range(19876, 19886),
         force_threaded: bool = False,
     ) -> None:
+        self._ctx = ctx
+        self._credential = None
         # Only probe for Qt when we'd actually use it. Importing Qt
         # transitively pulls librenderdoc.so in as a Vulkan capture
         # layer, which conflicts with the replay role of the same .so
@@ -610,7 +649,39 @@ class BridgeServer:
         return self._impl.port
 
     def start(self) -> None:
-        self._impl.start()
+        if self._credential is not None:
+            return
+
+        auth_token = credentials.generate_token()
+        self._impl.set_auth_token(auth_token)
+
+        try:
+            self._impl.start()
+            if self._impl.port is None:
+                self._impl.set_auth_token(None)
+                return
+
+            instance_id = getattr(self._ctx, "_worker_id", None)
+            if not instance_id:
+                instance_id = self._ctx.__class__.__name__
+            self._credential = credentials.publish_credential(
+                port=self._impl.port,
+                instance_id=instance_id,
+                token=auth_token,
+            )
+        except Exception:
+            try:
+                self._impl.stop()
+            finally:
+                self._impl.set_auth_token(None)
+            raise
 
     def stop(self) -> None:
-        self._impl.stop()
+        credential = self._credential
+        self._credential = None
+        try:
+            self._impl.stop()
+        finally:
+            self._impl.set_auth_token(None)
+            if credential is not None:
+                credentials.remove_credential(credential)

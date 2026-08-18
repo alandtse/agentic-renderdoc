@@ -2,7 +2,12 @@
 
 import json
 
+import pytest
+
 from extension import bridge
+
+
+AUTH_TOKEN = "a" * 64
 
 
 class FakeSignal:
@@ -89,8 +94,16 @@ def _responses(sock):
     return [json.loads(item.decode("utf-8")) for item in sock.writes]
 
 
+def _new_bridge():
+    return bridge._QtBridge(
+        object(),
+        range(19876, 19877),
+        auth_token=AUTH_TOKEN,
+    )
+
+
 def test_qt_connection_bounds_buffer_and_resets_idle_timer(monkeypatch):
-    qt_bridge = bridge._QtBridge(object(), range(19876, 19877))
+    qt_bridge = _new_bridge()
     sock = FakeSocket()
     monkeypatch.setattr(
         bridge,
@@ -103,12 +116,18 @@ def test_qt_connection_bounds_buffer_and_resets_idle_timer(monkeypatch):
     assert sock.read_buffer_size == bridge.MAX_REQUEST_BYTES
     assert state.timer.single_shot is True
 
-    sock.incoming.extend(b'{"cmd":"ev')
+    sock.incoming.extend(
+        b'{"auth":"' + AUTH_TOKEN.encode("ascii") + b'","cmd":"ev'
+    )
     sock.readyRead.emit()
     assert state.timer.active is True
     assert state.timer.interval == 5000
 
-    sock.incoming.extend(b'al"}\n{]\n{"cmd":"texture"}\n')
+    sock.incoming.extend(
+        b'al"}\n{]\n{"auth":"'
+        + AUTH_TOKEN.encode("ascii")
+        + b'","cmd":"texture"}\n'
+    )
     sock.readyRead.emit()
 
     assert state.timer.active is False
@@ -124,7 +143,7 @@ def test_qt_connection_bounds_buffer_and_resets_idle_timer(monkeypatch):
 
 
 def test_qt_oversized_request_reports_error_and_closes():
-    qt_bridge = bridge._QtBridge(object(), range(19876, 19877))
+    qt_bridge = _new_bridge()
     sock = FakeSocket()
     _accept(qt_bridge, sock)
     state = qt_bridge._connections[sock]
@@ -140,7 +159,7 @@ def test_qt_oversized_request_reports_error_and_closes():
 
 
 def test_qt_partial_request_timeout_reports_error_and_closes():
-    qt_bridge = bridge._QtBridge(object(), range(19876, 19877))
+    qt_bridge = _new_bridge()
     sock = FakeSocket()
     _accept(qt_bridge, sock)
     state = qt_bridge._connections[sock]
@@ -155,7 +174,7 @@ def test_qt_partial_request_timeout_reports_error_and_closes():
 
 
 def test_qt_rejects_connection_above_active_limit():
-    qt_bridge = bridge._QtBridge(object(), range(19876, 19877))
+    qt_bridge = _new_bridge()
     for _index in range(bridge.MAX_ACTIVE_CONNECTIONS):
         _accept(qt_bridge, FakeSocket())
     extra = FakeSocket()
@@ -169,7 +188,7 @@ def test_qt_rejects_connection_above_active_limit():
 
 
 def test_qt_buffered_eof_attempts_error_and_releases_state():
-    qt_bridge = bridge._QtBridge(object(), range(19876, 19877))
+    qt_bridge = _new_bridge()
     sock = FakeSocket()
     _accept(qt_bridge, sock)
 
@@ -180,3 +199,31 @@ def test_qt_buffered_eof_attempts_error_and_releases_state():
     assert _responses(sock)[0]["error_code"] == "incomplete_request"
     assert sock not in qt_bridge._connections
     assert sock.deleted is True
+
+
+@pytest.mark.parametrize("auth", [None, "b" * 64])
+def test_qt_rejects_unauthorized_request_before_dispatch(monkeypatch, auth):
+    qt_bridge = _new_bridge()
+    sock = FakeSocket()
+    dispatched = []
+    monkeypatch.setattr(
+        bridge,
+        "_dispatch",
+        lambda _ctx, request: dispatched.append(request),
+    )
+    _accept(qt_bridge, sock)
+    request = {"cmd": "eval", "params": {}}
+    if auth is not None:
+        request["auth"] = auth
+
+    sock.incoming.extend((json.dumps(request) + "\n").encode("utf-8"))
+    sock.readyRead.emit()
+
+    assert _responses(sock) == [{
+        "ok": False,
+        "error": "unauthorized",
+        "error_code": "unauthorized",
+    }]
+    assert dispatched == []
+    assert sock.disconnect_called is True
+    assert sock not in qt_bridge._connections
