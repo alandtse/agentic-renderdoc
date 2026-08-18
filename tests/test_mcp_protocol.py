@@ -2,15 +2,13 @@
 
 Ported from superbrian/master commit eda5493 (branch
 001-mcp2-migration-and-regression-tests, T006). Two of the three
-original cases depend on superbrian's flattened ``RenderDocClient``
-(``server.client.RenderDocClient``) and its ``_serialized_operation``
-lock, which we do not adopt -- our server uses the alias-routed
-``ConnectionPool`` instead. Per docs/SYNC_SUPERBRIAN.md Stage 4, those
-two cases are skipped here and deferred to Stage 5, which ports the
-operation-locking behavior onto ``ConnectionPool`` and re-points the
-``fake_renderdoc_client`` fixture at the pool interface. The
-tool-name/schema stability case needs only the MCP SDK v2 swap and so
-runs today.
+original cases depended on superbrian's flattened ``RenderDocClient``
+and its ``_serialized_operation`` lock. Stage 5
+(docs/SYNC_SUPERBRIAN.md) ports the operation-locking behavior onto our
+alias-routed ``ConnectionPool`` (per-connection ``_operation_lock``) and
+re-points the ``fake_renderdoc_client`` fixture at the pool interface,
+so both cases now run. The tool-name/schema stability case needed only
+the MCP SDK v2 swap and has run since Stage 4.
 """
 
 import json
@@ -66,11 +64,6 @@ async def test_tool_names_and_input_schemas_are_stable():
     assert task_schema["required"] == ["action"]
 
 
-@pytest.mark.skip(
-    reason="deferred to Stage 5: needs the conftest fake_renderdoc_client "
-    "fixture re-pointed from superbrian's flattened RenderDocClient to our "
-    "ConnectionPool (docs/SYNC_SUPERBRIAN.md Stage 5)"
-)
 @pytest.mark.anyio
 async def test_tool_results_preserve_dict_text_and_image_content(fake_renderdoc_client):
     async with Client(mcp) as client:
@@ -100,7 +93,12 @@ async def test_tool_results_preserve_dict_text_and_image_content(fake_renderdoc_
     assert texture_result["content"][1]["mimeType"] == "image/png"
     assert texture_result["content"][1]["data"]
 
-    assert _json_text_result(instance_result)["data"]["port"] == 19876
+    # Adapted from superbrian: our Instance(action="connect") returns the
+    # connection info at the TOP LEVEL of the tool result ({"ok": True,
+    # **info, "connections": ...}), not nested under a "data" key, so the
+    # port assertion reads the top-level "port" (docs/SYNC_SUPERBRIAN.md
+    # Stage 5).
+    assert _json_text_result(instance_result)["port"] == 19876
     assert fake_renderdoc_client.calls == [
         ("eval", {"code": "result = 42"}),
         ("api_index", {"query": "SetFrameEvent"}),
@@ -118,17 +116,16 @@ async def test_tool_results_preserve_dict_text_and_image_content(fake_renderdoc_
     ]
 
 
-@pytest.mark.skip(
-    reason="deferred to Stage 5: imports superbrian's flattened "
-    "server.client.RenderDocClient and its _serialized_operation lock, "
-    "which we do not adopt; locking is ported onto ConnectionPool in "
-    "Stage 5 (docs/SYNC_SUPERBRIAN.md Stage 5)"
-)
 @pytest.mark.anyio
 async def test_concurrent_protocol_calls_are_serialized(monkeypatch):
     from server.client import RenderDocClient
     from server import tools
 
+    # A single real RenderDocClient backs the pool. Its per-connection
+    # _operation_lock (Item 2, docs/SYNC_SUPERBRIAN.md Stage 5) serializes
+    # concurrent sends, so a blocking Eval holds off a concurrent
+    # Search-API on the same connection -- the property superbrian's
+    # _serialized_operation decorator provided on its flattened client.
     renderdoc = RenderDocClient()
     renderdoc._sock = object()
     renderdoc._port = 19876
@@ -144,7 +141,21 @@ async def test_concurrent_protocol_calls_are_serialized(monkeypatch):
         return {"ok": True, "data": {"command": cmd}}
 
     renderdoc._do_send = fake_send
-    monkeypatch.setattr(tools, "_client", renderdoc)
+
+    class _SingleConnectionPool:
+        """One-alias pool whose send() delegates to the real client."""
+
+        @property
+        def aliases(self):
+            return ["default"]
+
+        def ensure_connected(self):
+            pass
+
+        def send(self, cmd, params, alias=None, read_timeout=None):
+            return renderdoc.send(cmd, params, read_timeout=read_timeout)
+
+    monkeypatch.setattr(tools, "_pool", _SingleConnectionPool())
 
     results = {}
 

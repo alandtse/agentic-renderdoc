@@ -765,9 +765,27 @@ class ConnectionPool:
     Headless workers (spawned via ``open()``) are tracked alongside the
     connection: closing an alias's connection does NOT kill its worker;
     use ``close()`` for that. The connection and worker share an alias.
+
+    Locking discipline (Stage 5, docs/SYNC_SUPERBRIAN.md):
+
+      self._lock guards the registry dicts (_connections / _workers /
+      _default) and NOTHING else. While holding it, a method may mutate
+      only those dicts and may READ lock-free client attributes
+      (connected_port, _info). It must NEVER call client.send() /
+      connect() / disconnect() (those acquire the client's
+      _operation_lock and may block for a full read deadline), nor do
+      any I/O (_probe_port, proc.wait(), _wait_for_bridge, socket ops).
+      Every such operation runs on a reference obtained under the lock,
+      AFTER the lock is released. This keeps ConnectionPool._lock and
+      RenderDocClient._operation_lock never held simultaneously by the
+      same thread (no nesting), so a slow operation on one alias never
+      blocks a different alias.
     """
 
     def __init__(self) -> None:
+        # Re-entrant: read-only helpers (default_alias) are called from
+        # within methods that already hold it (e.g. _resolve -> default_alias).
+        self._lock        = threading.RLock()
         # alias -> RenderDocClient
         self._connections = {}   # type: Dict[str, RenderDocClient]
         # alias -> Popen for headless workers we spawned
@@ -786,7 +804,7 @@ class ConnectionPool:
                  capture's filename stem if omitted.
 
         Returns the instance_info dict for the connection, with the
-        chosen alias added.
+        chosen alias added. Client I/O runs outside self._lock.
         """
         client = RenderDocClient()
         client.connect(port)
@@ -809,18 +827,19 @@ class ConnectionPool:
         If alias is omitted, disconnects the sole active connection;
         raises if more than one is active.
 
-        Returns the alias that was disconnected.
+        Returns the alias that was disconnected. Client I/O runs
+        outside self._lock.
         """
-        target = self._only_alias(alias)
-        client = self._connections.pop(target, None)
+        with self._lock:
+            target = self._only_alias(alias)
+            client = self._connections.pop(target, None)
+            if self._default == target:
+                self._default = None
         if client is not None:
             try:
                 client.disconnect()
             except Exception:
                 pass
-
-        if self._default == target:
-            self._default = None
         return target
 
     # --- Worker lifecycle (spawn + close) ---
@@ -840,15 +859,16 @@ class ConnectionPool:
 
         Returns the worker metadata (alias, port, remote_port, pid, info).
         Raises RuntimeError on any spawn failure; the subprocess is
-        reaped if it was started.
+        reaped if it was started. Client I/O runs outside self._lock.
         """
         bind_wait = _WORKER_BIND_WAIT if bind_wait is None else bind_wait
         capture = Path(capture_path)
         if not capture.exists():
             raise RuntimeError("capture not found: {}".format(capture))
 
-        used_ports = {c.connected_port for c in self._connections.values()
-                      if c.connected_port is not None}
+        with self._lock:
+            used_ports = {c.connected_port for c in self._connections.values()
+                          if c.connected_port is not None}
         bridge_port = _first_free_port(_PORT_RANGE, exclude=used_ports)
         if bridge_port is None:
             raise RuntimeError(
@@ -923,8 +943,7 @@ class ConnectionPool:
         client.connect(bridge_port, worker_proc=proc)
         client._info = info
 
-        self._workers[alias] = proc
-        self._replace_alias(alias, client)
+        self._replace_alias(alias, client, worker_proc=proc)
 
         return {
             "alias"       : alias,
@@ -942,21 +961,28 @@ class ConnectionPool:
         force=True jumps straight to SIGKILL.
 
         Returns a status dict. Raises KeyError if the alias has no
-        associated worker (i.e. it was an external connect()).
+        associated worker (i.e. it was an external connect()). The
+        registry pop is one critical section; shutdown/client I/O runs
+        outside self._lock.
         """
-        target = self._only_alias(alias)
-        proc = self._workers.get(target)
-        if proc is None:
-            return {
-                "closed" : False,
-                "alias"  : target,
-                "reason" : (
-                    "alias {!r} has no worker (external connection); "
-                    "use Instance(action='disconnect') instead".format(target)
-                ),
-            }
-
-        port = self._connections[target].connected_port
+        with self._lock:
+            target = self._only_alias(alias)
+            proc = self._workers.get(target)
+            if proc is None:
+                return {
+                    "closed" : False,
+                    "alias"  : target,
+                    "reason" : (
+                        "alias {!r} has no worker (external connection); "
+                        "use Instance(action='disconnect') instead".format(target)
+                    ),
+                }
+            client = self._connections.get(target)
+            port = client.connected_port if client is not None else None
+            self._connections.pop(target, None)
+            self._workers.pop(target, None)
+            if self._default == target:
+                self._default = None
 
         if not force:
             try:
@@ -991,16 +1017,11 @@ class ConnectionPool:
 
         rc = proc.returncode
 
-        # Drop the connection and worker entry.
-        client = self._connections.pop(target, None)
         if client is not None:
             try:
                 client.disconnect()
             except Exception:
                 pass
-        self._workers.pop(target, None)
-        if self._default == target:
-            self._default = None
 
         return {
             "closed"    : True,
@@ -1014,36 +1035,46 @@ class ConnectionPool:
         """Clean up workers whose process exited unexpectedly.
 
         Returns a list of aliases whose workers had died. Useful for
-        liveness checks before reporting instance lists.
+        liveness checks before reporting instance lists. Orphaned
+        clients are disconnected outside self._lock.
         """
-        dead = []
-        for alias, proc in list(self._workers.items()):
-            if proc.poll() is not None:
-                dead.append(alias)
-                client = self._connections.pop(alias, None)
-                if client is not None:
-                    try:
-                        client.disconnect()
-                    except Exception:
-                        pass
-                self._workers.pop(alias, None)
-                if self._default == alias:
-                    self._default = None
+        with self._lock:
+            dead = []
+            orphaned = []  # type: List[RenderDocClient]
+            for alias, proc in list(self._workers.items()):
+                if proc.poll() is not None:
+                    dead.append(alias)
+                    client = self._connections.pop(alias, None)
+                    self._workers.pop(alias, None)
+                    if self._default == alias:
+                        self._default = None
+                    if client is not None:
+                        orphaned.append(client)
+        for client in orphaned:
+            try:
+                client.disconnect()
+            except Exception:
+                pass
         return dead
 
     # --- Routing ---
 
     def set_default(self, alias: str) -> None:
         """Set the alias used when send() is called without one."""
-        if alias not in self._connections:
-            raise KeyError("no connection named {!r}".format(alias))
-        self._default = alias
+        with self._lock:
+            if alias not in self._connections:
+                raise KeyError("no connection named {!r}".format(alias))
+            self._default = alias
 
     def send(self, cmd: str, params: dict,
              alias: Optional[str] = None,
              read_timeout: Optional[float] = None) -> dict:
-        """Send a command to a named (or default) connection."""
-        client = self._resolve(alias)
+        """Send a command to a named (or default) connection.
+
+        client.send() runs outside self._lock.
+        """
+        with self._lock:
+            client = self._resolve(alias)
         return client.send(cmd, params, read_timeout=read_timeout)
 
     def ensure_connected(self) -> dict:
@@ -1055,16 +1086,18 @@ class ConnectionPool:
 
         Returns a dict with port + alias + info for the (newly or
         previously) default connection. Raises ConnectionError if no
-        running instance is found.
+        running instance is found. The discovery path runs outside
+        self._lock.
         """
-        if self._connections:
-            alias = self.default_alias
-            client = self._connections[alias]
-            return {
-                "alias" : alias,
-                "port"  : client.connected_port,
-                "info"  : client._info,
-            }
+        with self._lock:
+            if self._connections:
+                alias = self.default_alias
+                client = self._connections[alias]
+                return {
+                    "alias" : alias,
+                    "port"  : client.connected_port,
+                    "info"  : client._info,
+                }
 
         for port in _PORT_RANGE:
             if _probe_port(port) is not None:
@@ -1082,13 +1115,16 @@ class ConnectionPool:
         """Probe the port range and return all running bridges.
 
         Annotates each entry with its alias if it is already in the pool,
-        and with a ``headless`` flag if the alias was spawned by us.
+        and with a ``headless`` flag if the alias was spawned by us. The
+        _probe_port loop runs outside self._lock.
         """
-        port_to_alias = {
-            c.connected_port: a
-            for a, c in self._connections.items()
-            if c.connected_port is not None
-        }
+        with self._lock:
+            port_to_alias = {
+                c.connected_port: a
+                for a, c in self._connections.items()
+                if c.connected_port is not None
+            }
+            worker_aliases = set(self._workers.keys())
 
         results = []
         for port in _PORT_RANGE:
@@ -1098,7 +1134,7 @@ class ConnectionPool:
             alias = port_to_alias.get(port)
             if alias is not None:
                 info["alias"]    = alias
-                info["headless"] = alias in self._workers
+                info["headless"] = alias in worker_aliases
             results.append(info)
         return results
 
@@ -1107,33 +1143,39 @@ class ConnectionPool:
     @property
     def aliases(self) -> List[str]:
         """All active connection aliases."""
-        return list(self._connections.keys())
+        with self._lock:
+            return list(self._connections.keys())
 
     @property
     def default_alias(self) -> Optional[str]:
         """Default alias for send(); auto-selects if exactly one connection."""
-        if self._default is None and len(self._connections) == 1:
-            return next(iter(self._connections))
-        return self._default
+        with self._lock:
+            if self._default is None and len(self._connections) == 1:
+                return next(iter(self._connections))
+            return self._default
 
     def connection_info(self) -> List[dict]:
         """Summary of all active connections: alias, port, info, headless."""
-        result = []
-        for alias, client in self._connections.items():
-            entry = {
-                "alias"    : alias,
-                "port"     : client.connected_port,
-                "headless" : alias in self._workers,
-            }
-            if client._info:
-                entry["info"] = client._info
-            result.append(entry)
-        return result
+        with self._lock:
+            result = []
+            for alias, client in self._connections.items():
+                entry = {
+                    "alias"    : alias,
+                    "port"     : client.connected_port,
+                    "headless" : alias in self._workers,
+                }
+                if client._info:
+                    entry["info"] = client._info
+                result.append(entry)
+            return result
 
     # --- Internal helpers ---
 
     def _resolve(self, alias: Optional[str]) -> RenderDocClient:
-        """Return the client for the given alias, falling back to the default."""
+        """Return the client for the given alias, falling back to the default.
+
+        Called with self._lock held (by send()).
+        """
         if not self._connections:
             raise ConnectionError(
                 "no RenderDoc connections; "
@@ -1158,7 +1200,10 @@ class ConnectionPool:
         return self._connections[target]
 
     def _only_alias(self, alias: Optional[str]) -> str:
-        """Resolve a sole-active alias when none was passed explicitly."""
+        """Resolve a sole-active alias when none was passed explicitly.
+
+        Called with self._lock held (by disconnect()/close()).
+        """
         if alias is not None:
             return alias
         if len(self._connections) == 1:
@@ -1171,28 +1216,42 @@ class ConnectionPool:
 
     def _unique_alias(self, candidate: str) -> str:
         """Append a numeric suffix if needed to avoid clobbering."""
-        if candidate not in self._connections:
-            return candidate
-        i = 2
-        while "{}_{}".format(candidate, i) in self._connections:
-            i += 1
-        return "{}_{}".format(candidate, i)
+        with self._lock:
+            if candidate not in self._connections:
+                return candidate
+            i = 2
+            while "{}_{}".format(candidate, i) in self._connections:
+                i += 1
+            return "{}_{}".format(candidate, i)
 
-    def _replace_alias(self, alias: str, client: RenderDocClient) -> None:
-        """Register client under alias, evicting any prior occupant."""
-        existing = self._connections.get(alias)
-        if existing is not None:
+    def _replace_alias(self, alias: str, client: RenderDocClient,
+                       worker_proc: Optional[subprocess.Popen] = None) -> None:
+        """Register client (and optional worker) under alias, evicting any prior.
+
+        Do not split the pop-and-insert across two lock acquisitions:
+        a concurrent send() could then resolve a half-evicted alias.
+        The evicted client is disconnected outside self._lock.
+        """
+        with self._lock:
+            existing = self._connections.get(alias)
+            self._connections[alias] = client
+            if worker_proc is not None:
+                self._workers[alias] = worker_proc
+            if self._default is None:
+                self._default = alias
+        if existing is not None and existing is not client:
             try:
                 existing.disconnect()
             except Exception:
                 pass
-        self._connections[alias] = client
-        if self._default is None:
-            self._default = alias
 
     @staticmethod
     def _fetch_info(client: RenderDocClient) -> Optional[dict]:
-        """Best-effort instance_info fetch right after connect."""
+        """Best-effort instance_info fetch right after connect.
+
+        Called UNLOCKED (by connect(), before _replace_alias); issues
+        client.send(), which takes the client's _operation_lock.
+        """
         try:
             resp = client.send("instance_info", {})
         except (ConnectionError, OSError):
