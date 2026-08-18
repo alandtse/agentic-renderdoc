@@ -19,6 +19,14 @@ dependencies = [
     "Pillow>=10.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "build>=1.2",
+    "hatchling>=1.27",
+    "mcp[cli]>=1.26",
+    "pytest>=8",
+]
+
 [project.urls]
 Repository = "https://github.com/EdenLabs/agentic-renderdoc"
 
@@ -36,3 +44,8 @@ build-backend = "hatchling.build"
 # (`python -m extension.headless ...`), so it has to be importable
 # from the same Python that runs the server.
 packages = ["src/server", "src/extension"]
+
+[tool.pytest.ini_options]
+markers = [
+    "windows_renderdoc: opt-in smoke tests that require RenderDoc 1.45 and a real .rdc capture",
+]
