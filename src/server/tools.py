@@ -17,7 +17,7 @@ from typing  import Any
 
 from PIL import Image as PILImage
 
-from mcp.server.fastmcp.utilities.types import Image as MCPImage
+from mcp.server.mcpserver import Image as MCPImage
 from mcp.types import TextContent
 
 from server.app import mcp
