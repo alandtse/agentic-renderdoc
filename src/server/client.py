@@ -26,6 +26,8 @@ import time
 from pathlib import Path
 from typing  import Dict, List, Optional
 
+from extension import credentials
+
 
 # Port range matching the extension's BridgeServer.
 _PORT_RANGE         = range(19876, 19886)
@@ -217,6 +219,9 @@ class RenderDocClient:
     """
 
     def __init__(self) -> None:
+        # Re-entrant: send() -> _refresh_credential_connection() -> connect()
+        # re-enters this lock on the same thread.
+        self._operation_lock = threading.RLock()
         self._sock          = None       # type: Optional[socket.socket]
         self._port          = None       # type: Optional[int]
         self._buffer        = ""
@@ -225,6 +230,9 @@ class RenderDocClient:
         # ConnectionPool after a successful connect/open so callers can
         # surface capture_path / api_type without re-querying.
         self._info          = None       # type: Optional[dict]
+        # Injected into every request by _do_send(); refreshed by
+        # _refresh_credential_connection().
+        self._credential    = None       # type: Optional[credentials.BridgeCredential]
 
     # --- Properties ---
 
@@ -245,44 +253,112 @@ class RenderDocClient:
 
     # --- Connection management ---
 
-    def connect(self, port: int, worker_proc: Optional[subprocess.Popen] = None) -> None:
-        """Connect to a RenderDoc instance on the given port.
+    def connect(self, port: int,
+                worker_proc: Optional[subprocess.Popen] = None) -> None:
+        """Connect to an authenticated RenderDoc bridge on the given port.
 
-        Closes any existing connection first, then opens a new TCP socket
-        to 127.0.0.1 on the specified port.
+        Closes any existing connection first, discovers the bridge
+        credential for the port, and opens a new TCP socket to
+        127.0.0.1. The credential is mandatory — a bare listener with
+        no published credential is never connected to.
+
+        Connect failures retry once after re-discovering credentials
+        (a just-started worker may publish its credential a moment
+        after binding). A refused connection drops the credential that
+        pointed at it.
 
         port        -- Bridge port to connect to.
         worker_proc -- Optional Popen handle if the pool spawned this
                        worker. Lets liveness checks during send-retry
-                       distinguish spawned-worker death from live-UI death.
+                       distinguish spawned-worker death from live-UI
+                       death. When None, any existing _worker_proc is
+                       preserved so a credential-refresh reconnect does
+                       not lose the pool's worker association.
         """
-        self.disconnect()
+        with self._operation_lock:
+            self._close_socket(explicit=False)
 
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(_CONNECT_TIMEOUT)
-        sock.connect(("127.0.0.1", port))
-        sock.settimeout(None)
+            candidates = _credentials_for_port(port)
+            if not candidates:
+                raise ConnectionError(
+                    "no bridge credential found for port {}".format(port)
+                )
 
-        self._sock        = sock
-        self._port        = port
-        self._worker_proc = worker_proc
+            first_error = None
+            attempted = set()
+            for attempt in range(2):
+                refreshed = _credentials_for_port(port)
+                available = [
+                    item for item in refreshed
+                    if item.credential_id not in attempted
+                ]
+                if not available:
+                    available = candidates[:1]
+                if not available:
+                    break
+                credential = available[0]
+                attempted.add(credential.credential_id)
+
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    sock.settimeout(_CONNECT_TIMEOUT)
+                    sock.connect(("127.0.0.1", port))
+                    sock.settimeout(None)
+                except (ConnectionRefusedError, TimeoutError, OSError) as error:
+                    try:
+                        sock.close()
+                    except OSError:
+                        pass
+                    if first_error is None:
+                        first_error = error
+                    if isinstance(error, ConnectionRefusedError):
+                        credentials.remove_credential(credential)
+                    if attempt == 0:
+                        continue
+                    break
+
+                self._sock        = sock
+                self._port        = port
+                self._credential   = credential
+                if worker_proc is not None:
+                    self._worker_proc = worker_proc
+                return
+
+            raise ConnectionError(
+                "could not connect to bridge on port {}".format(port)
+            ) from first_error
 
     def disconnect(self) -> None:
         """Close the current connection, if any.
 
         Does NOT terminate any associated worker process — that lives on
         ConnectionPool and is intentionally orthogonal to dropping the
-        socket. Use pool.close(alias) to stop the worker.
+        socket. Use pool.close(alias) to stop the worker. The cached
+        _worker_proc and _info are preserved across a disconnect so the
+        pool's worker association and instance metadata survive a
+        credential-refresh reconnect.
+        """
+        with self._operation_lock:
+            self._close_socket(explicit=True)
+
+    def _close_socket(self, explicit: bool) -> None:
+        """Drop socket and credential state without triggering discovery.
+
+        Clears the socket, port, read buffer, and credential. Keeps
+        _worker_proc and _info (owned by the pool). Called with the
+        operation lock held by connect()/disconnect(); also used from
+        _send_with_retry/_refresh_credential_connection where the lock
+        is already held via send().
         """
         if self._sock is not None:
             try:
                 self._sock.close()
             except OSError:
                 pass
-        self._sock        = None
-        self._port        = None
-        self._buffer      = ""
-        # Keep _worker_proc — the pool still owns it; we just dropped the socket.
+        self._sock       = None
+        self._port       = None
+        self._buffer     = ""
+        self._credential = None
 
     # --- Request / response ---
 
@@ -297,25 +373,30 @@ class RenderDocClient:
         Behaviors by failure mode:
           * Read timeout — single attempt, no retry. Returns a
             ``worker_timeout`` error.
-          * Connection refused / EOF — checks subprocess liveness for
-            spawned workers. If dead, returns ``worker_dead``. Otherwise
-            reconnects once and retries.
+          * Explicit ``unauthorized`` response — refreshes the
+            credential, reconnects, and retries once. Authentication
+            fails before bridge dispatch, so this retry cannot duplicate
+            command execution.
+          * Connection refused / EOF after the request began — never
+            retried, because the bridge may already have executed the
+            (potentially mutating) command. Returns ``worker_dead``.
 
         cmd          -- Command name (e.g. "eval", "instance_info").
         params       -- Command parameters dict.
         read_timeout -- Override the per-command default deadline.
         """
-        if self._sock is None:
-            raise ConnectionError(
-                "not connected; pool must call connect() before send()"
-            )
+        with self._operation_lock:
+            if self._sock is None:
+                raise ConnectionError(
+                    "not connected; pool must call connect() before send()"
+                )
 
-        try:
-            return self._send_with_retry(cmd, params, read_timeout)
-        except WorkerTimeoutError as e:
-            return _format_timeout_error(e)
-        except WorkerDeadError as e:
-            return _format_dead_error(e)
+            try:
+                return self._send_with_retry(cmd, params, read_timeout)
+            except WorkerTimeoutError as e:
+                return _format_timeout_error(e)
+            except WorkerDeadError as e:
+                return _format_dead_error(e)
 
     def _read_response(self) -> dict:
         """Read a newline-delimited JSON response."""
@@ -334,7 +415,14 @@ class RenderDocClient:
 
     def _send_with_retry(self, cmd: str, params: dict,
                          read_timeout: Optional[float]) -> dict:
-        """Execute a single send/recv with deadline + liveness-aware retry."""
+        """Execute a single send/recv with deadline + auth-aware retry.
+
+        Read-timeout and post-send connection failures are final because
+        the command may already be executing or complete. Only an
+        explicit ``unauthorized`` response refreshes credentials and
+        retries once; bridge authentication fails before dispatch, so
+        the retry cannot duplicate command execution.
+        """
         assert self._sock is not None
         assert self._port is not None
 
@@ -343,8 +431,20 @@ class RenderDocClient:
                   else _READ_TIMEOUTS.get(cmd, _DEFAULT_READ_TIMEOUT)
 
         try:
-            return self._do_send(cmd, params, read_timeout=timeout)
+            response = self._do_send(cmd, params, read_timeout=timeout)
+            if _is_unauthorized(response):
+                if not self._refresh_credential_connection(port):
+                    return response
+                response = self._do_send(cmd, params, read_timeout=timeout)
+                if _is_unauthorized(response):
+                    rejected = self._credential
+                    if rejected is not None:
+                        credentials.remove_credential(rejected)
+                    self._close_socket(explicit=False)
+            return response
         except TimeoutError:
+            # Worker is unresponsive but the connection is still open.
+            # No retry — a second attempt would just hang again.
             raise WorkerTimeoutError(
                 port       = port,
                 cmd        = cmd,
@@ -352,49 +452,35 @@ class RenderDocClient:
                 is_spawned = self.is_headless,
                 pid        = self._worker_pid(),
             )
-        except (ConnectionError, BrokenPipeError, OSError) as first_err:
-            # Connection-level failure. If our worker process is dead,
-            # don't bother retrying.
-            if not self._is_worker_alive():
-                pid = self._worker_pid()
-                self.disconnect()
-                raise WorkerDeadError(
-                    port       = port,
-                    cmd        = cmd,
-                    is_spawned = pid is not None,
-                    pid        = pid,
-                    original   = first_err,
-                )
-
-            # Worker still appears alive (or unknown live UI); reconnect once.
-            saved_proc = self._worker_proc
-            self.disconnect()
-            try:
-                self.connect(port, worker_proc=saved_proc)
-                return self._do_send(cmd, params, read_timeout=timeout)
-            except (ConnectionError, BrokenPipeError, OSError) as second_err:
-                pid = self._worker_pid()
-                raise WorkerDeadError(
-                    port       = port,
-                    cmd        = cmd,
-                    is_spawned = pid is not None,
-                    pid        = pid,
-                    original   = second_err,
-                )
-            except TimeoutError:
-                raise WorkerTimeoutError(
-                    port       = port,
-                    cmd        = cmd,
-                    timeout    = timeout,
-                    is_spawned = self.is_headless,
-                    pid        = self._worker_pid(),
-                )
+        except (ConnectionError, BrokenPipeError, OSError) as error:
+            # The request may have reached the bridge. Never automatically
+            # resend a potentially mutating Eval or shutdown command.
+            pid = self._worker_pid()
+            self._close_socket(explicit=False)
+            raise WorkerDeadError(
+                port       = port,
+                cmd        = cmd,
+                is_spawned = pid is not None,
+                pid        = pid,
+                original   = error,
+            )
 
     def _do_send(self, cmd: str, params: dict, read_timeout: float) -> dict:
-        """Raw send and receive on the current socket."""
-        assert self._sock is not None
+        """Raw send and receive on the current socket.
 
-        request = json.dumps({"cmd": cmd, "params": params}) + "\n"
+        Injects the connection's auth token into the request without
+        mutating the caller's params dict. Raises if the connection has
+        no credential — every connected bridge must have one.
+        """
+        assert self._sock is not None
+        if self._credential is None:
+            raise ConnectionError("connected bridge has no credential")
+
+        request = json.dumps({
+            "auth"  : self._credential.token,
+            "cmd"   : cmd,
+            "params": params,
+        }) + "\n"
 
         self._sock.settimeout(_WRITE_TIMEOUT)
         self._sock.sendall(request.encode("utf-8"))
@@ -402,18 +488,40 @@ class RenderDocClient:
         self._sock.settimeout(read_timeout)
         return self._read_response()
 
-    def _is_worker_alive(self) -> bool:
-        """True if the associated worker is alive or unknown (live UI)."""
+    def _refresh_credential_connection(self, port: int) -> bool:
+        """Discard a rejected credential and reconnect once before retry.
+
+        Drops the current socket and credential, removes the rejected
+        credential from the runtime store, and reconnects via connect()
+        (which re-discovers). Returns True if the reconnect succeeded.
+        Called with the operation lock already held (via send()); the
+        RLock permits the nested connect() re-entry.
+        """
+        rejected = self._credential
+        if rejected is not None:
+            credentials.remove_credential(rejected)
+        self._close_socket(explicit=False)
+        try:
+            self.connect(port)
+        except (ConnectionError, OSError):
+            return False
+        return True
+
+    def _is_worker_alive(self, port: int) -> bool:
+        """True if the associated worker is alive or unknown (live UI).
+
+        For workers the pool spawned, ``Popen.poll`` is authoritative.
+        Avoid ``os.kill(pid, 0)`` — Windows implements non-console
+        signals via TerminateProcess, which would kill the worker. For
+        unknown ports (a live RenderDoc UI), default to True and let the
+        connection result decide. ``port`` is accepted for signature
+        compatibility with the superbrian send/retry path; this client
+        holds a single _worker_proc.
+        """
         proc = self._worker_proc
         if proc is None:
             return True
-        if proc.poll() is not None:
-            return False
-        try:
-            os.kill(proc.pid, 0)
-        except OSError:
-            return False
-        return True
+        return proc.poll() is None
 
     def _worker_pid(self) -> Optional[int]:
         """PID of the associated worker, or None if not headless."""
@@ -424,36 +532,35 @@ class RenderDocClient:
 # Port discovery (module-level — pool and probes share this)
 # ---------------------------------------------------------------------------
 
-def _probe_port(port: int, enrich: bool = False) -> Optional[dict]:
-    """Probe a single port for a running RenderDoc bridge.
+def _is_unauthorized(response: dict) -> bool:
+    """True if the bridge rejected the request as unauthorized."""
+    return (
+        isinstance(response, dict)
+        and response.get("ok") is False
+        and response.get("error_code") == "unauthorized"
+    )
 
-    Attempts a TCP connection to 127.0.0.1 on the given port. If the
-    connection succeeds and enrich is True, sends an instance_info
-    command and merges the response into the returned dict.
 
-    Returns a dict with at least {"port": port} on success, or None if
-    the port is not reachable.
+def _credentials_for_port(port: int) -> List["credentials.BridgeCredential"]:
+    """Live bridge credentials published for a specific port."""
+    return [
+        item for item in credentials.discover_credentials()
+        if item.port == port
+    ]
+
+
+def _query_instance_info(sock: socket.socket, auth_token: str) -> dict:
+    """Send one authenticated instance_info request on a probe socket.
+
+    Returns the parsed response dict, or an empty dict on any transport
+    or parse failure. Never raises — callers treat {} as "no info".
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(_PROBE_TIMEOUT)
-
     try:
-        sock.connect(("127.0.0.1", port))
-    except (ConnectionRefusedError, TimeoutError, OSError):
-        sock.close()
-        return None
-
-    result = {"port": port}
-    if enrich:
-        result = _enrich_instance(sock, result)
-    sock.close()
-    return result
-
-
-def _enrich_instance(sock: socket.socket, instance: dict) -> dict:
-    """Query instance_info over an already-connected probe socket."""
-    try:
-        request = json.dumps({"cmd": "instance_info", "params": {}}) + "\n"
+        request = json.dumps({
+            "auth"  : auth_token,
+            "cmd"   : "instance_info",
+            "params": {},
+        }) + "\n"
 
         sock.settimeout(_ENRICH_TIMEOUT)
         sock.sendall(request.encode("utf-8"))
@@ -462,20 +569,74 @@ def _enrich_instance(sock: socket.socket, instance: dict) -> dict:
         while "\n" not in buf:
             chunk = sock.recv(65536)
             if not chunk:
-                return instance
+                return {}
             buf += chunk.decode("utf-8")
 
         line = buf.split("\n", 1)[0]
-        resp = json.loads(line)
-
-        if resp.get("ok") and isinstance(resp.get("data"), dict):
-            merged = {**resp["data"], **instance}
-            return merged
+        response = json.loads(line)
+        return response if isinstance(response, dict) else {}
     except (ConnectionError, BrokenPipeError, OSError,
             json.JSONDecodeError, UnicodeDecodeError):
-        pass
+        return {}
 
-    return instance
+
+def _probe_port(port: int, enrich: bool = False) -> Optional[dict]:
+    """Probe a single port for an authenticated RenderDoc bridge.
+
+    Tries each live credential for the port and authenticates an
+    instance_info request. A bare TCP listener with no published
+    credential is never considered a RenderDoc instance. The probe
+    socket is always closed before return.
+
+    Returns a dict with at least {"port": port} on success, or None if
+    the port is not reachable or no credential authenticates.
+    """
+    for credential in _credentials_for_port(port):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(_PROBE_TIMEOUT)
+        try:
+            sock.connect(("127.0.0.1", port))
+            response = _query_instance_info(sock, credential.token)
+        except ConnectionRefusedError:
+            credentials.remove_credential(credential)
+            continue
+        except (TimeoutError, OSError):
+            continue
+        finally:
+            sock.close()
+
+        if _is_unauthorized(response):
+            credentials.remove_credential(credential)
+            continue
+        if not response.get("ok") or not isinstance(response.get("data"), dict):
+            continue
+
+        result = {"port": port}
+        if enrich:
+            result = {**response["data"], **result}
+        return result
+
+    return None
+
+
+def _listener_on_port(port: int) -> bool:
+    """True if anything is listening on port (bare TCP connect probe).
+
+    Unlike _probe_port, this does NOT require a credential. Used by
+    _first_free_port for collision detection: a credential-less listener
+    (e.g. ``renderdoccmd remoteserver`` on the remote port range, or a
+    bridge whose credential file is momentarily absent) still occupies
+    the port and must not be treated as free.
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(_PROBE_TIMEOUT)
+    try:
+        sock.connect(("127.0.0.1", port))
+    except (ConnectionRefusedError, TimeoutError, OSError):
+        sock.close()
+        return False
+    sock.close()
+    return True
 
 
 def _first_free_port(port_range: range,
@@ -486,15 +647,18 @@ def _first_free_port(port_range: range,
     extension's bridge listener also sets SO_REUSEADDR (upstream
     ``bridge.py``), so two listeners can coexist on the same port and
     bind() would silently succeed against a port that already has a
-    running bridge. Connect-probe first to detect a live bridge.
+    running bridge. A bare connect-probe (_listener_on_port) detects any
+    listener — including credential-less ones the auth-aware _probe_port
+    would miss (e.g. ``renderdoccmd remoteserver`` on the remote range).
     """
     excl = exclude or set()
     for port in port_range:
         if port in excl:
             continue
-        if _probe_port(port) is not None:
+        if _listener_on_port(port):
             # Something is already listening — could be a GUI bridge on
-            # the same port we'd otherwise hijack via SO_REUSEADDR.
+            # the same port we'd otherwise hijack via SO_REUSEADDR, or a
+            # credential-less remoteserver child.
             continue
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -523,12 +687,28 @@ def _wait_for_bridge(proc: subprocess.Popen, port: int,
 
 
 def _send_shutdown_to(port: int) -> None:
-    """One-shot shutdown command to a bridge on a specific port."""
+    """One-shot authenticated shutdown command to a bridge on a port.
+
+    Discovers the bridge credential for the port and authenticates the
+    shutdown request. Raises ConnectionError if no credential is
+    published for the port.
+    """
+    candidates = _credentials_for_port(port)
+    if not candidates:
+        raise ConnectionError(
+            "no bridge credential found for port {}".format(port)
+        )
+    credential = candidates[0]
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(_CONNECT_TIMEOUT)
     s.connect(("127.0.0.1", port))
     s.settimeout(_WRITE_TIMEOUT)
-    s.sendall(b'{"cmd":"shutdown","params":{}}\n')
+    request = json.dumps({
+        "auth"  : credential.token,
+        "cmd"   : "shutdown",
+        "params": {},
+    }) + "\n"
+    s.sendall(request.encode("utf-8"))
     s.settimeout(2.0)
     try:
         s.recv(1024)
